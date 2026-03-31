@@ -1,0 +1,16 @@
+name: CI
+
+on: [push, pull_request]
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - run: npm ci || true
+      - run: node -e "JSON.parse(require('fs').readFileSync('package.json', 'utf8'))"
+      - run: bash -n scripts/keep-awake.sh
+      - run: bash -n scripts/stop-awake.sh

@@ -1,0 +1,11 @@
+{
+  "name": "keep-awake",
+  "version": "1.0.0",
+  "description": "Prevents Mac from sleeping while Claude Code is working",
+  "author": {
+    "name": "AxGord",
+    "email": "axgord@gmail.com",
+    "url": "https://github.com/AxGord"
+  },
+  "license": "MIT"
+}
