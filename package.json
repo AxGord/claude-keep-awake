@@ -1,7 +1,7 @@
 {
   "name": "claude-keep-awake",
   "version": "1.0.0",
-  "description": "Prevents Mac from sleeping while Claude Code is working",
+  "description": "Prevents your computer from sleeping while Claude Code is working (macOS, Linux, Windows)",
   "author": "AxGord <axgord@gmail.com> (https://github.com/AxGord)",
   "license": "MIT",
   "repository": {
