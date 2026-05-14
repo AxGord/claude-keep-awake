@@ -3,25 +3,24 @@
 [![npm version](https://img.shields.io/npm/v/claude-keep-awake.svg)](https://www.npmjs.com/package/claude-keep-awake)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 
-A [Claude Code](https://docs.anthropic.com/en/docs/claude-code) plugin that prevents your computer from sleeping while Claude Code is working. Supports macOS, Linux, and Windows.
+A [Claude Code](https://docs.anthropic.com/en/docs/claude-code) plugin that prevents your computer from sleeping while Claude Code is working. Supports macOS (including **closed-lid** keep-awake on Apple Silicon), Linux, and Windows.
 
 ## Features
 
-- Automatically activates when you submit a prompt or Claude uses a tool
-- Per-session tracking — multiple Claude Code sessions are handled independently
-- Auto-expires after 30 minutes of inactivity
-- Cleans up on session end — no orphaned processes
-- Cross-platform: macOS, Linux (systemd), Windows (Git Bash)
+- Activates on prompt submit / tool use, releases on session end
+- **One shared daemon per machine** — multiple Claude Code sessions reference-count automatically
+- **macOS Apple Silicon: stays awake with the lid closed** without an external display, without `sudo`, without code-signing
+- Audible lid feedback on macOS — Submarine on close, Bottle on open
+- Self-monitor: daemon exits if all registered sessions die (covers Claude Code crashes)
+- Cross-platform: macOS, Linux (systemd / gnome-session), Windows (Git Bash + PowerShell)
 
 ## Quick Start
-
-Install from the Claude Code plugin marketplace:
 
 ```
 claude plugin add claude-keep-awake
 ```
 
-Or install manually:
+Or manually:
 
 ```bash
 git clone https://github.com/AxGord/claude-keep-awake.git
@@ -30,37 +29,50 @@ claude plugin add ./claude-keep-awake
 
 ## How It Works
 
-The plugin uses Claude Code [hooks](https://docs.anthropic.com/en/docs/claude-code/hooks) to manage a platform-specific sleep inhibitor:
+Two coordinated pieces:
 
-| Hook | Action |
-|------|--------|
-| `UserPromptSubmit` | Starts/refreshes sleep inhibitor (30 min timeout) |
-| `PostToolUse` | Starts/refreshes sleep inhibitor (30 min timeout) |
-| `Stop` | Kills inhibitor process and cleans up PID file |
+1. **`scripts/keep-awake.sh`** — fires on every `UserPromptSubmit` and `PostToolUse` hook. Registers the current session in `~/.claude/keep-awake-state/sessions/<session_id>` and starts a daemon if none is running.
+2. **`scripts/stop-awake.sh`** — fires on the `Stop` hook. Removes the session file. If it was the last live session, terminates the daemon.
 
-Each session stores its inhibitor PID in `/tmp/claude-caffeinate-<session_id>.pid`. When a new prompt or tool use triggers the hook, any existing process is killed and a fresh 30-minute timer starts.
+The daemon is platform-specific:
 
-### Platform Details
-
-| OS | Method | What it prevents |
-|----|--------|-----------------|
-| **macOS** | `caffeinate -dis` | Display, idle, and system sleep |
-| **Linux** | `systemd-inhibit` (fallback: `gnome-session-inhibit`) | Idle and suspend |
+| OS | Daemon | What it prevents |
+|----|--------|------------------|
+| **macOS Apple Silicon / Intel** | Swift binary compiled from `src/keep-awake-daemon.swift` | `IOPMAssertion` (idle/display/system) + IOKit selector 12 (`kPMSetClamshellSleepState`) → blocks both idle sleep and lid-close sleep |
+| **macOS (no Xcode CLT)** | Fallback: `caffeinate -dis` | Idle/display/system sleep only; **lid-close still triggers DarkWake** |
+| **Linux** | `systemd-inhibit --what=sleep:idle` (fallback: `gnome-session-inhibit`) | Idle and suspend |
 | **Windows** | `SetThreadExecutionState` via PowerShell | Display and system sleep |
 
-## Configuration
+### Closed-lid keep-awake on macOS
 
-The default timeout is **1800 seconds** (30 minutes). To change it, edit `scripts/keep-awake.sh` and modify the `TIMEOUT` variable:
+The Swift daemon uses an undocumented but publicly accessible IOKit selector (`kPMSetClamshellSleepState = 12` on `IOPMrootDomain`). Setting it to `1` makes the kernel ignore the lid-close event, keeping the system **fully awake** instead of entering DarkWake. Verified on Apple Silicon + macOS Sequoia, on both AC and battery, without any external display.
 
-```bash
-TIMEOUT=1800  # Change to your desired timeout in seconds
+When you close the lid:
+- The display panel and keyboard backlight power off automatically (hardware path — not fought)
+- The system stays at full clock; Claude Code processes do not get throttled
+- An audible **Submarine** chime confirms the keep-awake is active
+- On open, **Bottle** chime confirms normal operation resumed
+
+If `swiftc` is not available, the plugin falls back to plain `caffeinate -dis` — that still prevents idle sleep, but lid-close on Apple Silicon will throw the system into DarkWake (network limited, processes throttled).
+
+### State files
+
 ```
+~/.claude/keep-awake-state/
+├── daemon.pid              # current daemon PID
+├── sessions/
+│   ├── <session-id>        # Claude Code parent PID, one file per active session
+│   └── ...
+└── .lock                   # atomic mkdir lock for state mutations
+```
+
+Log: `/tmp/keep-awake-daemon.log` (truncated on each daemon restart).
 
 ## Requirements
 
-- **macOS** — no extra dependencies (`caffeinate` is built-in)
-- **Linux** — `systemd-inhibit` (available on all systemd-based distros) or `gnome-session-inhibit`
-- **Windows** — Git Bash or similar bash environment with access to `powershell.exe`
+- **macOS** — Xcode Command Line Tools for `swiftc` (`xcode-select --install`). Without it, falls back to plain `caffeinate` (no closed-lid support).
+- **Linux** — `systemd-inhibit` (standard on systemd distros) or `gnome-session-inhibit`
+- **Windows** — Git Bash with access to `powershell.exe`
 
 ## License
 
