@@ -56,6 +56,8 @@ Main loop is `CFRunLoopRun()` (not `dispatchMain()`) so CFRunLoop sources used b
 
 **Known limitation — AC-plug forced sleep on Apple Silicon**: when AC is plugged in while the lid is closed, macOS schedules a brief forced sleep (~5s) that bypasses all userspace sleep-prevention paths. The kernel sends `kIOMessageSystemWillSleep` directly — there is no `kIOMessageCanSystemSleep` to veto. No IOPMAssertion type, selector 12, `IOPMConnectionCreate`, or `pmset acwake` setting prevents this on AS. The only known workaround is `sudo pmset -a disablesleep 1` (root-only) — used by Amphetamine's "Power Protect" via a passwordless sudoers fragment. This plugin keeps the no-root, no-entitlement design and auto-recovers via `kIOMessageSystemHasPoweredOn` re-apply; the brief micro-sleep is unavoidable.
 
+To warn the user *before* they close the lid in this unsafe window, the daemon writes `~/.claude/keep-awake-state/lid-unsafe-until` (UNIX timestamp) on AC plug-in and removes it when full wake completes. Use the `scripts/statusline-keep-awake.sh` snippet in your Claude Code statusLine to display a countdown — see "Statusline integration" below.
+
 When you close the lid:
 - The built-in display brightness is set to 0 via the private `DisplayServices` framework (backlight off)
 - The system stays at full clock; Claude Code processes do not get throttled
@@ -69,11 +71,27 @@ If `swiftc` is not available, the plugin falls back to plain `caffeinate -dis` �
 ```
 ~/.claude/keep-awake-state/
 ├── daemon.pid              # current daemon PID
+├── lid-unsafe-until        # UNIX timestamp; present briefly after AC plug-in
 ├── sessions/
 │   ├── <session-id>        # Claude Code parent PID, one file per active session
 │   └── ...
 └── .lock                   # atomic mkdir lock for state mutations
 ```
+
+### Statusline integration (optional)
+
+Show a countdown in your Claude Code statusLine while AC-plug forced sleep is pending:
+
+```json
+{
+  "statusLine": {
+    "type": "command",
+    "command": "~/.claude/plugins/keep-awake/scripts/statusline-keep-awake.sh"
+  }
+}
+```
+
+Outputs `⚠ Don't close lid: 12s` while the unsafe window is active, nothing otherwise. To combine with an existing statusline, call both commands and concatenate their output.
 
 Log: `/tmp/keep-awake-daemon.log` (truncated on each daemon restart).
 

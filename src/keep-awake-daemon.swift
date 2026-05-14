@@ -22,7 +22,11 @@ let STATE_DIR = ProcessInfo.processInfo.environment["KEEP_AWAKE_STATE_DIR"]
     ?? "\(NSHomeDirectory())/.claude/keep-awake-state"
 let SESSIONS_DIR = "\(STATE_DIR)/sessions"
 let DAEMON_PID_FILE = "\(STATE_DIR)/daemon.pid"
+let LID_UNSAFE_FILE = "\(STATE_DIR)/lid-unsafe-until"
 let EMPTY_GRACE_SEC: TimeInterval = 300  // exit after 5 min with no sessions
+// AC plug-in on Apple Silicon causes a brief forced sleep (kernel bug, no userspace fix).
+// Mark the lid as unsafe-to-close for this window so a statusline can warn the user.
+let UNSAFE_LID_WINDOW_SEC: TimeInterval = 20
 
 // ---------- logging ----------
 let logFmt: ISO8601DateFormatter = {
@@ -112,6 +116,41 @@ func reapplyPower() {
     setClamshellSleep(disable: true)
 }
 
+// ---------- AC plug-in detection (for "unsafe lid" statusline countdown) ----------
+var wasOnAC: Bool = false
+
+func isOnAC() -> Bool {
+    guard let info = IOPSCopyPowerSourcesInfo()?.takeRetainedValue() else { return false }
+    guard let typeCF = IOPSGetProvidingPowerSourceType(info)?.takeUnretainedValue() else { return false }
+    return (typeCF as String) == kIOPSACPowerValue
+}
+
+func markLidUnsafe() {
+    let until = Int(Date().timeIntervalSince1970 + UNSAFE_LID_WINDOW_SEC)
+    do {
+        try "\(until)\n".write(toFile: LID_UNSAFE_FILE, atomically: true, encoding: .utf8)
+        log("AC plugged → marking lid unsafe until \(until) (\(Int(UNSAFE_LID_WINDOW_SEC))s)")
+    } catch {
+        log("markLidUnsafe write err: \(error)")
+    }
+}
+
+func clearLidUnsafe() {
+    guard FileManager.default.fileExists(atPath: LID_UNSAFE_FILE) else { return }
+    try? FileManager.default.removeItem(atPath: LID_UNSAFE_FILE)
+    log("lid unsafe cleared (wake completed)")
+}
+
+// IOPS callback wrapper: detect plug-in edge, mark unsafe, then re-apply state.
+func handlePowerSourceChange() {
+    let cur = isOnAC()
+    if cur && !wasOnAC {
+        markLidUnsafe()
+    }
+    wasOnAC = cur
+    reapplyPower()
+}
+
 // ---------- IORegisterForSystemPower (active sleep veto) ----------
 // Catches CanSystemSleep (we can refuse) and SystemHasPoweredOn (re-apply state after
 // a full wake — covers the AC-plug dark-wake race that IOPS misses).
@@ -137,6 +176,7 @@ let systemPowerCallback: IOServiceInterestCallback = { _, _, messageType, argume
         IOAllowPowerChange(rootPowerPort, arg)
     case kIOMessageSystemHasPoweredOn_raw:
         log("system has powered on → re-apply")
+        clearLidUnsafe()
         reapplyPower()
     default:
         break
@@ -270,6 +310,7 @@ func cleanup() {
     cleanedUp = true
     setClamshellSleep(disable: false)
     restoreBuiltin(immediate: true)
+    clearLidUnsafe()
     releaseAssertions()
     closeClamshellHandles()
     closeSystemPowerNotifications()
@@ -301,6 +342,8 @@ for sig in [SIGTERM, SIGINT, SIGHUP] {
 log("daemon starting")
 loadDisplayServices()
 findBuiltinDisplay()
+wasOnAC = isOnAC()
+log("initial AC state: \(wasOnAC)")
 createAssertions()
 setClamshellSleep(disable: true)
 setupSystemPowerNotifications()
@@ -329,7 +372,7 @@ pollTimer.resume()
 
 // Re-apply power state on AC↔battery transitions (workaround for Apple Silicon
 // dark-wake bug that invalidates the clamshell-disable flag).
-let psCallback: IOPowerSourceCallbackType = { _ in reapplyPower() }
+let psCallback: IOPowerSourceCallbackType = { _ in handlePowerSourceChange() }
 if let psSource = IOPSCreateLimitedPowerNotification(psCallback, nil)?.takeRetainedValue() {
     CFRunLoopAddSource(CFRunLoopGetMain(), psSource, CFRunLoopMode.defaultMode)
     log("limited power notification: subscribed")
