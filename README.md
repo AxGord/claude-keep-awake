@@ -47,11 +47,20 @@ The daemon is platform-specific:
 
 The Swift daemon uses an undocumented but publicly accessible IOKit selector (`kPMSetClamshellSleepState = 12` on `IOPMrootDomain`). Setting it to `1` makes the kernel ignore the lid-close event, keeping the system **fully awake** instead of entering DarkWake. Verified on Apple Silicon + macOS Sequoia, on both AC and battery, without any external display.
 
+**AC↔battery transitions**: the dark→full wake cycle triggered by plugging or unplugging power invalidates the clamshell-disable flag (Apple's own pmconfigd re-evaluates it on full wake). The daemon defends with three layers:
+- `IORegisterForSystemPower` callback: on `kIOMessageCanSystemSleep` issues `IOCancelPowerChange` (active veto); on `kIOMessageSystemHasPoweredOn` re-applies assertions and selector 12
+- `IOPSCreateLimitedPowerNotification` callback: on every AC↔battery edge re-applies state
+- 30s heartbeat: re-issues selector 12 as a safety net
+
+Main loop is `CFRunLoopRun()` (not `dispatchMain()`) so CFRunLoop sources used by these IOKit notifications actually fire.
+
+**Known limitation — AC-plug forced sleep on Apple Silicon**: when AC is plugged in while the lid is closed, macOS schedules a brief forced sleep (~5s) that bypasses all userspace sleep-prevention paths. The kernel sends `kIOMessageSystemWillSleep` directly — there is no `kIOMessageCanSystemSleep` to veto. No IOPMAssertion type, selector 12, `IOPMConnectionCreate`, or `pmset acwake` setting prevents this on AS. The only known workaround is `sudo pmset -a disablesleep 1` (root-only) — used by Amphetamine's "Power Protect" via a passwordless sudoers fragment. This plugin keeps the no-root, no-entitlement design and auto-recovers via `kIOMessageSystemHasPoweredOn` re-apply; the brief micro-sleep is unavoidable.
+
 When you close the lid:
-- The display panel and keyboard backlight power off automatically (hardware path — not fought)
+- The built-in display brightness is set to 0 via the private `DisplayServices` framework (backlight off)
 - The system stays at full clock; Claude Code processes do not get throttled
 - An audible **Submarine** chime confirms the keep-awake is active
-- On open, **Bottle** chime confirms normal operation resumed
+- On open, **Bottle** chime confirms normal operation resumed; brightness fades back to its saved value over ~500ms (minimum restore floor 0.05 if saved was lower)
 
 If `swiftc` is not available, the plugin falls back to plain `caffeinate -dis` — that still prevents idle sleep, but lid-close on Apple Silicon will throw the system into DarkWake (network limited, processes throttled).
 

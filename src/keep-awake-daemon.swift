@@ -10,6 +10,8 @@
 import Foundation
 import IOKit
 import IOKit.pwr_mgt
+import IOKit.ps
+import CoreGraphics
 
 let LOG_PATH = "/tmp/keep-awake-daemon.log"
 let SOUND_CLOSE = "/System/Library/Sounds/Submarine.aiff"
@@ -99,6 +101,149 @@ func closeClamshellHandles() {
     if pmService != 0 { IOObjectRelease(pmService); pmService = 0 }
 }
 
+// On Apple Silicon, the dark-wake → full-wake cycle that follows an AC plug/unplug
+// invalidates the clamshell-disable flag (Apple's pmconfigd preserves it across dark
+// wakes but re-evaluates on full wake). Re-apply assertions and selector 12 on AC↔battery
+// edges, on system wake, and on a slow heartbeat as a safety net.
+func reapplyPower() {
+    log("re-applying power assertions and clamshell flag")
+    releaseAssertions()
+    createAssertions()
+    setClamshellSleep(disable: true)
+}
+
+// ---------- IORegisterForSystemPower (active sleep veto) ----------
+// Catches CanSystemSleep (we can refuse) and SystemHasPoweredOn (re-apply state after
+// a full wake — covers the AC-plug dark-wake race that IOPS misses).
+// Message constants are #define macros not exported to Swift — use raw values.
+// iokit_common_msg(0xNNN) = 0xE0000000 | 0xNNN.
+let kIOMessageCanSystemSleep_raw: UInt32 = 0xE0000270
+let kIOMessageSystemWillSleep_raw: UInt32 = 0xE0000280
+let kIOMessageSystemHasPoweredOn_raw: UInt32 = 0xE0000300
+
+var rootPowerPort: io_connect_t = 0
+var rootPowerNotifier: io_object_t = 0
+var rootPowerNotifyPort: IONotificationPortRef? = nil
+
+let systemPowerCallback: IOServiceInterestCallback = { _, _, messageType, argument in
+    let arg = Int(bitPattern: argument)
+    switch messageType {
+    case kIOMessageCanSystemSleep_raw:
+        log("system asking permission to sleep → cancel")
+        IOCancelPowerChange(rootPowerPort, arg)
+        reapplyPower()
+    case kIOMessageSystemWillSleep_raw:
+        log("system will sleep (mandatory ack)")
+        IOAllowPowerChange(rootPowerPort, arg)
+    case kIOMessageSystemHasPoweredOn_raw:
+        log("system has powered on → re-apply")
+        reapplyPower()
+    default:
+        break
+    }
+}
+
+func setupSystemPowerNotifications() {
+    rootPowerPort = IORegisterForSystemPower(nil, &rootPowerNotifyPort, systemPowerCallback, &rootPowerNotifier)
+    guard rootPowerPort != 0, let port = rootPowerNotifyPort else {
+        log("system power notifications: register failed")
+        return
+    }
+    CFRunLoopAddSource(CFRunLoopGetMain(), IONotificationPortGetRunLoopSource(port).takeUnretainedValue(), CFRunLoopMode.defaultMode)
+    log("system power notifications: subscribed")
+}
+
+func closeSystemPowerNotifications() {
+    if rootPowerNotifier != 0 { IODeregisterForSystemPower(&rootPowerNotifier); rootPowerNotifier = 0 }
+    if let port = rootPowerNotifyPort { IONotificationPortDestroy(port); rootPowerNotifyPort = nil }
+    if rootPowerPort != 0 { IOServiceClose(rootPowerPort); rootPowerPort = 0 }
+}
+
+// ---------- DisplayServices brightness (private framework via dlopen) ----------
+// API used by `brightness`, `nightlight` CLI. Works on Apple Silicon, no root, no entitlements.
+typealias DSGetBrightnessFn = @convention(c) (CGDirectDisplayID, UnsafeMutablePointer<Float>) -> Int32
+typealias DSSetBrightnessFn = @convention(c) (CGDirectDisplayID, Float) -> Int32
+
+let DIM_BRIGHTNESS: Float = 0.0
+let MIN_RESTORE_BRIGHTNESS: Float = 0.05  // floor for restore target when saved was very low
+let RESTORE_FADE_MS: Int = 500
+let RESTORE_FADE_STEPS: Int = 20
+let POWER_HEARTBEAT_SEC: Double = 30.0
+var dsGetBrightness: DSGetBrightnessFn? = nil
+var dsSetBrightness: DSSetBrightnessFn? = nil
+var builtinDisplayID: CGDirectDisplayID? = nil
+var savedBrightness: Float? = nil  // nil = not currently dimmed by us
+
+func loadDisplayServices() {
+    let path = "/System/Library/PrivateFrameworks/DisplayServices.framework/DisplayServices"
+    guard let h = dlopen(path, RTLD_LAZY) else {
+        let err = dlerror().map { String(cString: $0) } ?? "unknown"
+        log("DisplayServices: dlopen failed: \(err)")
+        return
+    }
+    guard let getSym = dlsym(h, "DisplayServicesGetBrightness"),
+          let setSym = dlsym(h, "DisplayServicesSetBrightness")
+    else {
+        log("DisplayServices: dlsym failed")
+        return
+    }
+    dsGetBrightness = unsafeBitCast(getSym, to: DSGetBrightnessFn.self)
+    dsSetBrightness = unsafeBitCast(setSym, to: DSSetBrightnessFn.self)
+    log("DisplayServices: loaded")
+}
+
+func findBuiltinDisplay() {
+    var count: UInt32 = 0
+    var err = CGGetActiveDisplayList(0, nil, &count)
+    guard err == .success, count > 0 else {
+        log("builtin display: CGGetActiveDisplayList err=\(err.rawValue) count=\(count)")
+        return
+    }
+    var ids = [CGDirectDisplayID](repeating: 0, count: Int(count))
+    err = CGGetActiveDisplayList(count, &ids, &count)
+    guard err == .success else {
+        log("builtin display: CGGetActiveDisplayList(2) err=\(err.rawValue)")
+        return
+    }
+    for id in ids where CGDisplayIsBuiltin(id) != 0 {
+        builtinDisplayID = id
+        log("builtin display id=\(id)")
+        return
+    }
+    log("builtin display: not found (external-only setup)")
+}
+
+func dimBuiltin() {
+    guard let id = builtinDisplayID, let getFn = dsGetBrightness, let setFn = dsSetBrightness else { return }
+    var cur: Float = 0
+    let gr = getFn(id, &cur)
+    guard gr == 0 else { log("dim: get err=\(gr)"); return }
+    savedBrightness = cur
+    let sr = setFn(id, DIM_BRIGHTNESS)
+    log("dim: saved=\(cur), set=\(DIM_BRIGHTNESS), ret=\(sr)")
+}
+
+func restoreBuiltin(immediate: Bool = false) {
+    guard let id = builtinDisplayID, let setFn = dsSetBrightness, let saved = savedBrightness else { return }
+    let target = max(saved, MIN_RESTORE_BRIGHTNESS)
+    savedBrightness = nil
+    if immediate {
+        let sr = setFn(id, target)
+        log("restore (immediate): set=\(target) (saved=\(saved)), ret=\(sr)")
+        return
+    }
+    log("restore: fading from \(DIM_BRIGHTNESS) to \(target) over \(RESTORE_FADE_MS)ms (saved=\(saved))")
+    let stepSec = Double(RESTORE_FADE_MS) / 1000.0 / Double(RESTORE_FADE_STEPS)
+    for i in 1...RESTORE_FADE_STEPS {
+        let frac = Float(i) / Float(RESTORE_FADE_STEPS)
+        let v = DIM_BRIGHTNESS + (target - DIM_BRIGHTNESS) * frac
+        DispatchQueue.main.asyncAfter(deadline: .now() + stepSec * Double(i)) {
+            if savedBrightness != nil { return }  // re-dimmed mid-fade → abort
+            _ = setFn(id, v)
+        }
+    }
+}
+
 // ---------- read lid state ----------
 func readLidClosed() -> Bool {
     let svc = IOServiceGetMatchingService(kIOMainPortDefault, IOServiceMatching("IOPMrootDomain"))
@@ -124,8 +269,10 @@ func cleanup() {
     if cleanedUp { return }
     cleanedUp = true
     setClamshellSleep(disable: false)
+    restoreBuiltin(immediate: true)
     releaseAssertions()
     closeClamshellHandles()
+    closeSystemPowerNotifications()
     // remove our pid file if it still points to us
     if let pidStr = try? String(contentsOfFile: DAEMON_PID_FILE, encoding: .utf8),
        Int32(pidStr.trimmingCharacters(in: .whitespacesAndNewlines)) == getpid() {
@@ -152,8 +299,11 @@ for sig in [SIGTERM, SIGINT, SIGHUP] {
 
 // ---------- main ----------
 log("daemon starting")
+loadDisplayServices()
+findBuiltinDisplay()
 createAssertions()
 setClamshellSleep(disable: true)
+setupSystemPowerNotifications()
 
 var lastLidClosed = readLidClosed()
 log("initial lid closed: \(lastLidClosed)")
@@ -166,14 +316,34 @@ pollTimer.setEventHandler {
         if cur {
             log("lid closed → Submarine")
             playSound(SOUND_CLOSE)
+            dimBuiltin()
         } else {
             log("lid opened → Bottle")
             playSound(SOUND_OPEN)
+            restoreBuiltin()
         }
     }
     lastLidClosed = cur
 }
 pollTimer.resume()
+
+// Re-apply power state on AC↔battery transitions (workaround for Apple Silicon
+// dark-wake bug that invalidates the clamshell-disable flag).
+let psCallback: IOPowerSourceCallbackType = { _ in reapplyPower() }
+if let psSource = IOPSCreateLimitedPowerNotification(psCallback, nil)?.takeRetainedValue() {
+    CFRunLoopAddSource(CFRunLoopGetMain(), psSource, CFRunLoopMode.defaultMode)
+    log("limited power notification: subscribed")
+} else {
+    log("limited power notification: subscribe failed")
+}
+
+// Heartbeat: re-issue selector 12 periodically as a safety net for events we don't catch.
+let heartbeatTimer = DispatchSource.makeTimerSource(queue: .main)
+heartbeatTimer.schedule(deadline: .now() + POWER_HEARTBEAT_SEC, repeating: POWER_HEARTBEAT_SEC)
+heartbeatTimer.setEventHandler {
+    setClamshellSleep(disable: true)
+}
+heartbeatTimer.resume()
 
 // Self-monitor: exit when all registered sessions are dead.
 // Sessions dir empty for >EMPTY_GRACE_SEC also triggers exit (covers manual launch with no hook).
@@ -203,4 +373,6 @@ monitorTimer.setEventHandler {
 }
 monitorTimer.resume()
 
-dispatchMain()
+// CFRunLoopRun (not dispatchMain) — required so IOPSCreateLimitedPowerNotification
+// callbacks fire. dispatchMain pumps GCD only, not CFRunLoop sources.
+CFRunLoopRun()
