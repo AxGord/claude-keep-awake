@@ -12,5 +12,18 @@ jobs:
           node-version: '22'
       - run: npm ci || true
       - run: node -e "JSON.parse(require('fs').readFileSync('package.json', 'utf8'))"
+      - run: node -e "JSON.parse(require('fs').readFileSync('.claude-plugin/plugin.json', 'utf8'))"
+      - run: node -e "JSON.parse(require('fs').readFileSync('hooks/hooks.json', 'utf8'))"
       - run: bash -n scripts/keep-awake.sh
       - run: bash -n scripts/stop-awake.sh
+
+  swift:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: swiftc version
+        run: swiftc --version
+      - name: Build daemon
+        run: swiftc -O src/keep-awake-daemon.swift -o /tmp/keep-awake-daemon
+      - name: Verify binary is arm64 Mach-O
+        run: file /tmp/keep-awake-daemon | grep -E "Mach-O .* (arm64|x86_64)"
