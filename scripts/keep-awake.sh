@@ -4,13 +4,19 @@
 # Falls back to plain caffeinate / systemd-inhibit / Windows API if swiftc unavailable.
 set -u
 
-read -t 1 -r INPUT || true
-SESSION_ID=$(echo "$INPUT" | grep -o '"session_id":"[^"]*"' | cut -d'"' -f4)
-SESSION_ID="${SESSION_ID:-default}"
+# Key sessions by the Claude CLI process PID, not session_id: a single CLI
+# process changes session_id (on /clear, /compact, resume) but its PID is
+# stable for its whole lifetime. UUID keying leaked one file per session_id
+# that Stop never reaped, holding the daemon awake indefinitely.
+read -t 1 -r _ || true  # drain hook stdin
 PARENT_PID="${PPID:-$$}"
 
 PLUGIN_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 STATE_DIR="${HOME}/.claude/keep-awake-state"
+
+# Kill-switch: if this file exists, do nothing (Mac may sleep normally).
+[ -e "$STATE_DIR/disabled" ] && exit 0
+
 SESSIONS_DIR="$STATE_DIR/sessions"
 DAEMON_PID_FILE="$STATE_DIR/daemon.pid"
 LOCK_DIR="$STATE_DIR/.lock"
@@ -104,6 +110,6 @@ start_daemon() {
 
 # ---------- main ----------
 acquire_lock
-echo "$PARENT_PID" > "$SESSIONS_DIR/$SESSION_ID"
+echo "$PARENT_PID" > "$SESSIONS_DIR/$PARENT_PID"
 reap_dead_sessions
 daemon_alive || start_daemon

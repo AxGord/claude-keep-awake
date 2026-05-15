@@ -3,9 +3,9 @@
 # terminate the daemon (which performs its own cleanup).
 set -u
 
-read -t 1 -r INPUT || true
-SESSION_ID=$(echo "$INPUT" | grep -o '"session_id":"[^"]*"' | cut -d'"' -f4)
-SESSION_ID="${SESSION_ID:-default}"
+# Keyed by Claude CLI PID, matching keep-awake.sh (session_id is unstable).
+read -t 1 -r _ || true  # drain hook stdin
+PARENT_PID="${PPID:-$$}"
 
 STATE_DIR="${HOME}/.claude/keep-awake-state"
 SESSIONS_DIR="$STATE_DIR/sessions"
@@ -36,7 +36,7 @@ has_live_sessions() {
 }
 
 acquire_lock
-rm -f "$SESSIONS_DIR/$SESSION_ID"
+rm -f "$SESSIONS_DIR/$PARENT_PID"
 
 if ! has_live_sessions; then
   if [ -f "$DAEMON_PID_FILE" ]; then

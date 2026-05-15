@@ -31,8 +31,10 @@ claude plugin add ./claude-keep-awake
 
 Two coordinated pieces:
 
-1. **`scripts/keep-awake.sh`** — fires on every `UserPromptSubmit` and `PostToolUse` hook. Registers the current session in `~/.claude/keep-awake-state/sessions/<session_id>` and starts a daemon if none is running.
+1. **`scripts/keep-awake.sh`** — fires on every `UserPromptSubmit` and `PostToolUse` hook. Registers the current session in `~/.claude/keep-awake-state/sessions/<cli-pid>` and starts a daemon if none is running. Sessions are keyed by the Claude CLI process PID (stable for the process lifetime), not `session_id` (which changes on `/clear`, `/compact`, resume — UUID keying leaked one file per session_id that `Stop` never reaped).
 2. **`scripts/stop-awake.sh`** — fires on the `Stop` hook. Removes the session file. If it was the last live session, terminates the daemon.
+
+**Kill-switch**: create `~/.claude/keep-awake-state/disabled` to make the hooks a no-op (Mac sleeps normally); delete it to resume. Takes effect on the next hook in any active session.
 
 The daemon is platform-specific:
 
@@ -71,9 +73,10 @@ If `swiftc` is not available, the plugin falls back to plain `caffeinate -dis` �
 ```
 ~/.claude/keep-awake-state/
 ├── daemon.pid              # current daemon PID
+├── disabled                # optional kill-switch; if present, hooks no-op
 ├── lid-unsafe-until        # UNIX timestamp; present briefly after AC plug-in
 ├── sessions/
-│   ├── <session-id>        # Claude Code parent PID, one file per active session
+│   ├── <cli-pid>           # Claude CLI process PID, one file per live CLI process
 │   └── ...
 └── .lock                   # atomic mkdir lock for state mutations
 ```
