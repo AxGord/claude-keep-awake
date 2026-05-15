@@ -14,8 +14,8 @@ import IOKit.ps
 import CoreGraphics
 
 let LOG_PATH = "/tmp/keep-awake-daemon.log"
-let SOUND_CLOSE = "/System/Library/Sounds/Submarine.aiff"
-let SOUND_OPEN  = "/System/Library/Sounds/Bottle.aiff"
+let SOUND_CLOSE = "/System/Library/Sounds/Bottle.aiff"
+let SOUND_OPEN  = "/System/Library/Sounds/Submarine.aiff"
 let kPMSetClamshellSleepState: UInt32 = 12
 
 let STATE_DIR = ProcessInfo.processInfo.environment["KEEP_AWAKE_STATE_DIR"]
@@ -357,11 +357,11 @@ pollTimer.setEventHandler {
     let cur = readLidClosed()
     if cur != lastLidClosed {
         if cur {
-            log("lid closed → Submarine")
+            log("lid closed → Bottle")
             playSound(SOUND_CLOSE)
             dimBuiltin()
         } else {
-            log("lid opened → Bottle")
+            log("lid opened → Submarine")
             playSound(SOUND_OPEN)
             restoreBuiltin()
         }
