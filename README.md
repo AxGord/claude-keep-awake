@@ -11,7 +11,7 @@ A [Claude Code](https://docs.anthropic.com/en/docs/claude-code) plugin that prev
 - **One shared daemon per machine** — multiple Claude Code sessions reference-count automatically
 - **macOS Apple Silicon: stays awake with the lid closed** without an external display, without `sudo`, without code-signing
 - Audible lid feedback on macOS — Submarine on close, Bottle on open
-- Self-monitor: daemon exits if all registered sessions die (covers Claude Code crashes)
+- Self-monitor: daemon exits if all registered sessions die (covers Claude Code crashes), or if no hook fires for 2h (covers a hung-but-alive CLI)
 - Cross-platform: macOS, Linux (systemd / gnome-session), Windows (Git Bash + PowerShell)
 
 ## Quick Start
