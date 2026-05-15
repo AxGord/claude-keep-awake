@@ -14,8 +14,8 @@ import IOKit.ps
 import CoreGraphics
 
 let LOG_PATH = "/tmp/keep-awake-daemon.log"
-let SOUND_CLOSE = "/System/Library/Sounds/Submarine.aiff"
-let SOUND_OPEN  = "/System/Library/Sounds/Bottle.aiff"
+let SOUND_CLOSE = "/System/Library/Sounds/Bottle.aiff"
+let SOUND_OPEN  = "/System/Library/Sounds/Submarine.aiff"
 let kPMSetClamshellSleepState: UInt32 = 12
 
 let STATE_DIR = ProcessInfo.processInfo.environment["KEEP_AWAKE_STATE_DIR"]
@@ -24,6 +24,10 @@ let SESSIONS_DIR = "\(STATE_DIR)/sessions"
 let DAEMON_PID_FILE = "\(STATE_DIR)/daemon.pid"
 let LID_UNSAFE_FILE = "\(STATE_DIR)/lid-unsafe-until"
 let EMPTY_GRACE_SEC: TimeInterval = 300  // exit after 5 min with no sessions
+// keep-awake.sh rewrites sessions/<pid> on every UserPromptSubmit/PostToolUse.
+// If the newest session file goes untouched this long, the CLI is alive but
+// hung (no hooks firing) — release the machine rather than hold it awake forever.
+let HOOK_IDLE_LIMIT: TimeInterval = 7200  // 2h
 // AC plug-in on Apple Silicon causes a brief forced sleep (kernel bug, no userspace fix).
 // Mark the lid as unsafe-to-close for this window so a statusline can warn the user.
 let UNSAFE_LID_WINDOW_SEC: TimeInterval = 20
@@ -357,11 +361,11 @@ pollTimer.setEventHandler {
     let cur = readLidClosed()
     if cur != lastLidClosed {
         if cur {
-            log("lid closed → Submarine")
+            log("lid closed → Bottle")
             playSound(SOUND_CLOSE)
             dimBuiltin()
         } else {
-            log("lid opened → Bottle")
+            log("lid opened → Submarine")
             playSound(SOUND_OPEN)
             restoreBuiltin()
         }
@@ -405,6 +409,20 @@ monitorTimer.setEventHandler {
         return
     }
     emptyDirSince = nil
+
+    // Watchdog: a hung-but-alive CLI passes the kill(0) check forever. Bail if
+    // no hook has touched any session file within HOOK_IDLE_LIMIT.
+    var newestTouch: Date? = nil
+    for f in files {
+        guard let m = (try? FileManager.default.attributesOfItem(atPath: "\(SESSIONS_DIR)/\(f)"))?[.modificationDate] as? Date
+        else { continue }
+        if newestTouch == nil || m > newestTouch! { newestTouch = m }
+    }
+    if let n = newestTouch, Date().timeIntervalSince(n) > HOOK_IDLE_LIMIT {
+        log("no hook activity for >\(Int(HOOK_IDLE_LIMIT))s (CLI hung) → self-exit")
+        cleanup(); exit(0)
+    }
+
     for f in files {
         guard let content = try? String(contentsOfFile: "\(SESSIONS_DIR)/\(f)", encoding: .utf8),
               let pid = Int32(content.trimmingCharacters(in: .whitespacesAndNewlines))
