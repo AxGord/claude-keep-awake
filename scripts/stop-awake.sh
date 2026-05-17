@@ -9,6 +9,7 @@ PARENT_PID="${PPID:-$$}"
 
 STATE_DIR="${HOME}/.claude/keep-awake-state"
 SESSIONS_DIR="$STATE_DIR/sessions"
+PAUSED_DIR="$STATE_DIR/paused"
 DAEMON_PID_FILE="$STATE_DIR/daemon.pid"
 LOCK_DIR="$STATE_DIR/.lock"
 
@@ -37,6 +38,7 @@ has_live_sessions() {
 
 acquire_lock
 rm -f "$SESSIONS_DIR/$PARENT_PID"
+rm -f "$PAUSED_DIR/$PARENT_PID"
 
 if ! has_live_sessions; then
   if [ -f "$DAEMON_PID_FILE" ]; then

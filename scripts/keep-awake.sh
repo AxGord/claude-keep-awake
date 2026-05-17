@@ -18,6 +18,7 @@ STATE_DIR="${HOME}/.claude/keep-awake-state"
 [ -e "$STATE_DIR/disabled" ] && exit 0
 
 SESSIONS_DIR="$STATE_DIR/sessions"
+PAUSED_DIR="$STATE_DIR/paused"
 DAEMON_PID_FILE="$STATE_DIR/daemon.pid"
 LOCK_DIR="$STATE_DIR/.lock"
 
@@ -48,6 +49,7 @@ reap_dead_sessions() {
     local pid; pid=$(cat "$f" 2>/dev/null) || true
     if [ -z "$pid" ] || ! kill -0 "$pid" 2>/dev/null; then
       rm -f "$f"
+      rm -f "$PAUSED_DIR/${pid:-$(basename "$f")}"
     fi
   done
 }
@@ -111,5 +113,6 @@ start_daemon() {
 # ---------- main ----------
 acquire_lock
 echo "$PARENT_PID" > "$SESSIONS_DIR/$PARENT_PID"
+rm -f "$PAUSED_DIR/$PARENT_PID"  # resume: a hook fired → Claude is working again
 reap_dead_sessions
 daemon_alive || start_daemon

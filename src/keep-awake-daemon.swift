@@ -21,6 +21,10 @@ let kPMSetClamshellSleepState: UInt32 = 12
 let STATE_DIR = ProcessInfo.processInfo.environment["KEEP_AWAKE_STATE_DIR"]
     ?? "\(NSHomeDirectory())/.claude/keep-awake-state"
 let SESSIONS_DIR = "\(STATE_DIR)/sessions"
+// pause-awake.sh writes paused/<PID> when a session is blocked waiting for the
+// user (permission prompt, AskUserQuestion, plan approval). keep-awake.sh
+// removes it on the next hook. A session is "active" only if it has no marker.
+let PAUSED_DIR = "\(STATE_DIR)/paused"
 let DAEMON_PID_FILE = "\(STATE_DIR)/daemon.pid"
 let LID_UNSAFE_FILE = "\(STATE_DIR)/lid-unsafe-until"
 let EMPTY_GRACE_SEC: TimeInterval = 300  // exit after 5 min with no sessions
@@ -55,6 +59,10 @@ func log(_ msg: String) {
 var assertionIDs: [IOPMAssertionID] = []
 var pmConnection: io_connect_t = 0
 var pmService: io_service_t = 0
+// True while we hold sleep-prevention (assertions + clamshell + sleep veto).
+// Starts true: main() acquires immediately. Flipped off when every live
+// session is paused, back on when any session resumes.
+var assertionsHeld = true
 
 // ---------- IOPMAssertion (replaces caffeinate -dis) ----------
 func createAssertions() {
@@ -120,6 +128,38 @@ func reapplyPower() {
     setClamshellSleep(disable: true)
 }
 
+// ---------- per-session pause ----------
+// A session is active iff its PID is alive AND it has no paused/<PID> marker.
+// Session filename == PID string (keep-awake.sh); marker filename matches.
+func hasActiveSession() -> Bool {
+    let files = (try? FileManager.default.contentsOfDirectory(atPath: SESSIONS_DIR)) ?? []
+    for f in files {
+        guard let content = try? String(contentsOfFile: "\(SESSIONS_DIR)/\(f)", encoding: .utf8),
+              let pid = Int32(content.trimmingCharacters(in: .whitespacesAndNewlines))
+        else { continue }
+        if kill(pid, 0) != 0 { continue }                                           // dead
+        if FileManager.default.fileExists(atPath: "\(PAUSED_DIR)/\(f)") { continue } // paused
+        return true
+    }
+    return false
+}
+
+// Hold sleep-prevention iff some session is working. Releasing also drops the
+// active sleep veto (see kIOMessageCanSystemSleep_raw) so the OS may sleep.
+func updateHold() {
+    let want = hasActiveSession()
+    if want == assertionsHeld { return }
+    assertionsHeld = want
+    if want {
+        log("session resumed → re-acquiring")
+        reapplyPower()
+    } else {
+        log("all sessions paused → releasing")
+        releaseAssertions()
+        setClamshellSleep(disable: false)
+    }
+}
+
 // ---------- AC plug-in detection (for "unsafe lid" statusline countdown) ----------
 var wasOnAC: Bool = false
 
@@ -152,7 +192,7 @@ func handlePowerSourceChange() {
         markLidUnsafe()
     }
     wasOnAC = cur
-    reapplyPower()
+    if assertionsHeld { reapplyPower() }
 }
 
 // ---------- IORegisterForSystemPower (active sleep veto) ----------
@@ -172,16 +212,21 @@ let systemPowerCallback: IOServiceInterestCallback = { _, _, messageType, argume
     let arg = Int(bitPattern: argument)
     switch messageType {
     case kIOMessageCanSystemSleep_raw:
-        log("system asking permission to sleep → cancel")
-        IOCancelPowerChange(rootPowerPort, arg)
-        reapplyPower()
+        if assertionsHeld {
+            log("system asking permission to sleep → cancel")
+            IOCancelPowerChange(rootPowerPort, arg)
+            reapplyPower()
+        } else {
+            log("system asking permission to sleep → allow (all sessions paused)")
+            IOAllowPowerChange(rootPowerPort, arg)
+        }
     case kIOMessageSystemWillSleep_raw:
         log("system will sleep (mandatory ack)")
         IOAllowPowerChange(rootPowerPort, arg)
     case kIOMessageSystemHasPoweredOn_raw:
         log("system has powered on → re-apply")
         clearLidUnsafe()
-        reapplyPower()
+        if assertionsHeld { reapplyPower() }
     default:
         break
     }
@@ -371,6 +416,7 @@ pollTimer.setEventHandler {
         }
     }
     lastLidClosed = cur
+    updateHold()
 }
 pollTimer.resume()
 
@@ -388,7 +434,7 @@ if let psSource = IOPSCreateLimitedPowerNotification(psCallback, nil)?.takeRetai
 let heartbeatTimer = DispatchSource.makeTimerSource(queue: .main)
 heartbeatTimer.schedule(deadline: .now() + POWER_HEARTBEAT_SEC, repeating: POWER_HEARTBEAT_SEC)
 heartbeatTimer.setEventHandler {
-    setClamshellSleep(disable: true)
+    if assertionsHeld { setClamshellSleep(disable: true) }
 }
 heartbeatTimer.resume()
 
@@ -423,12 +469,15 @@ monitorTimer.setEventHandler {
         cleanup(); exit(0)
     }
 
+    var anyAlive = false
     for f in files {
         guard let content = try? String(contentsOfFile: "\(SESSIONS_DIR)/\(f)", encoding: .utf8),
               let pid = Int32(content.trimmingCharacters(in: .whitespacesAndNewlines))
         else { continue }
-        if kill(pid, 0) == 0 { return }  // at least one alive
+        if kill(pid, 0) == 0 { anyAlive = true }
+        else { try? FileManager.default.removeItem(atPath: "\(PAUSED_DIR)/\(f)") }  // dead → reap marker
     }
+    if anyAlive { return }
     log("all registered sessions dead → self-exit")
     cleanup(); exit(0)
 }
