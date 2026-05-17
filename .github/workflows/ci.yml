@@ -16,6 +16,7 @@ jobs:
       - run: node -e "JSON.parse(require('fs').readFileSync('hooks/hooks.json', 'utf8'))"
       - run: bash -n scripts/keep-awake.sh
       - run: bash -n scripts/stop-awake.sh
+      - run: bash -n scripts/pause-awake.sh
 
   swift:
     runs-on: macos-latest

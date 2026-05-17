@@ -1,6 +1,6 @@
 {
   "name": "keep-awake",
-  "version": "2.0.0",
+  "version": "2.1.0",
   "description": "Prevents your computer from sleeping while Claude Code is working; on Apple Silicon also blocks lid-close sleep (no sudo, no entitlements). macOS / Linux / Windows.",
   "author": {
     "name": "AxGord",
