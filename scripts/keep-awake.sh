@@ -8,7 +8,8 @@ set -u
 # process changes session_id (on /clear, /compact, resume) but its PID is
 # stable for its whole lifetime. UUID keying leaked one file per session_id
 # that Stop never reaped, holding the daemon awake indefinitely.
-read -t 1 -r _ || true  # drain hook stdin
+HOOK_INPUT=""
+while IFS= read -t 1 -r _line || [ -n "$_line" ]; do HOOK_INPUT+="$_line"; done  # full hook stdin (JSON; tolerate no trailing newline)
 PARENT_PID="${PPID:-$$}"
 
 PLUGIN_DIR="$(cd "$(dirname "$0")/.." && pwd)"
@@ -16,6 +17,17 @@ STATE_DIR="${HOME}/.claude/keep-awake-state"
 
 # Kill-switch: if this file exists, do nothing (Mac may sleep normally).
 [ -e "$STATE_DIR/disabled" ] && exit 0
+
+# AskUserQuestion blocks waiting for the user with no Notification event (unlike
+# permission prompts / plan approval). Its only surrounding hook is PreToolUse,
+# which would otherwise resume. Pause here instead so the Mac can sleep; the
+# PostToolUse after the user answers resumes via the default path below.
+HOOK_INPUT_NS="${HOOK_INPUT// /}"
+case "$HOOK_INPUT_NS" in
+  *'"hook_event_name":"PreToolUse"'*'"tool_name":"AskUserQuestion"'*|\
+  *'"tool_name":"AskUserQuestion"'*'"hook_event_name":"PreToolUse"'*)
+    exec bash "$PLUGIN_DIR/scripts/pause-awake.sh" ;;
+esac
 
 SESSIONS_DIR="$STATE_DIR/sessions"
 PAUSED_DIR="$STATE_DIR/paused"
