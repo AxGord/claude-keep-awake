@@ -7,7 +7,7 @@
 # the matcher is present and (b) the underlying scripts behave correctly
 # when invoked in the order hooks.json runs them.
 set -u
-ROOT="/Users/axg/dev/claude/keep-awake"
+ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 SCRIPTS="$ROOT/scripts"
 FAIL=0
 
