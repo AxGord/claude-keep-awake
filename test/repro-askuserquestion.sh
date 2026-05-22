@@ -2,32 +2,15 @@
 # Regression test: the Mac must be allowed to sleep while AskUserQuestion
 # blocks waiting for the user, and must resume once the user answers.
 #
-# Dispatch lives in hooks.json (PreToolUse matcher "AskUserQuestion"
-# declared after the catch-all keep-awake.sh). This test verifies (a)
-# the matcher is present and (b) the underlying scripts behave correctly
-# when invoked in the order hooks.json runs them.
+# Dispatch is inline in keep-awake.sh (it reads stdin, detects PreToolUse
+# AskUserQuestion, execs pause-awake.sh). A previous hooks.json-matcher
+# approach raced: pause-awake.sh's `: > marker` finished before
+# keep-awake.sh's `rm -f marker`, leaving the Mac awake.
 set -u
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 SCRIPTS="$ROOT/scripts"
 FAIL=0
 
-# (a) hooks.json wires PreToolUse "AskUserQuestion" → pause-awake.sh,
-#     declared after the catch-all keep-awake.sh.
-HOOKS="$ROOT/hooks/hooks.json"
-python3 - "$HOOKS" <<'PY' && echo "  PASS: hooks.json wires AskUserQuestion → pause-awake.sh (after keep-awake)" \
-  || { echo "  FAIL: hooks.json AskUserQuestion dispatch missing or wrong order"; FAIL=1; }
-import json, sys
-entries = json.load(open(sys.argv[1]))["hooks"]["PreToolUse"]
-def cmd(e): return e["hooks"][0]["command"]
-ok = (
-    len(entries) >= 2
-    and "matcher" not in entries[0] and "keep-awake.sh" in cmd(entries[0])
-    and entries[1].get("matcher") == "AskUserQuestion" and "pause-awake.sh" in cmd(entries[1])
-)
-sys.exit(0 if ok else 1)
-PY
-
-# (b) underlying scripts behave correctly.
 run() {  # <hook-script> <event-json> -> runs it in a fresh isolated HOME
   HOME="$(mktemp -d)"; export HOME
   PAUSED="$HOME/.claude/keep-awake-state/paused/$$"
@@ -45,18 +28,19 @@ assert() {  # <desc> <paused|awake>
 run pause-awake.sh '{"hook_event_name":"Notification"}'
 assert "Notification (plan/permission) -> sleep" paused
 
-# Simulate hooks.json ordering: catch-all keep-awake.sh runs first, then
-# pause-awake.sh (matched on AskUserQuestion). Marker must end up set.
-HOME="$(mktemp -d)"; export HOME
-PAUSED="$HOME/.claude/keep-awake-state/paused/$$"
-echo '{"hook_event_name":"PreToolUse","tool_name":"AskUserQuestion"}' | bash "$SCRIPTS/keep-awake.sh" >/dev/null 2>&1
-echo '{"hook_event_name":"PreToolUse","tool_name":"AskUserQuestion"}' | bash "$SCRIPTS/pause-awake.sh" >/dev/null 2>&1
-assert "PreToolUse AskUserQuestion (keep-awake then pause-awake) -> sleep" paused
+run keep-awake.sh '{"hook_event_name":"PreToolUse","tool_name":"AskUserQuestion"}'
+assert "PreToolUse AskUserQuestion -> sleep" paused
 
 run keep-awake.sh '{"hook_event_name":"PostToolUse","tool_name":"AskUserQuestion"}'
 assert "PostToolUse AskUserQuestion (answered) -> resume" awake
 
 run keep-awake.sh '{"hook_event_name":"PreToolUse","tool_name":"Bash"}'
 assert "PreToolUse normal tool -> resume" awake
+
+# A hypothetical "AskUserQuestionFoo" tool must not misfire: the substring
+# match includes the closing quote of the JSON value, so prefix-match alone
+# can't trigger pause.
+run keep-awake.sh '{"hook_event_name":"PreToolUse","tool_name":"AskUserQuestionFoo"}'
+assert "PreToolUse AskUserQuestionFoo (closing-quote guard) -> resume" awake
 
 exit $FAIL

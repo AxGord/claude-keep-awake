@@ -8,7 +8,8 @@ set -u
 # process changes session_id (on /clear, /compact, resume) but its PID is
 # stable for its whole lifetime. UUID keying leaked one file per session_id
 # that Stop never reaped, holding the daemon awake indefinitely.
-read -t 1 -r _ || true  # drain hook stdin
+# Single read captures full JSON (NUL delimiter → reads to EOF). 1s cap.
+IFS= read -r -t 1 -d '' HOOK_INPUT || true
 PARENT_PID="${PPID:-$$}"
 
 PLUGIN_DIR="$(cd "$(dirname "$0")/.." && pwd)"
@@ -17,10 +18,16 @@ STATE_DIR="${HOME}/.claude/keep-awake-state"
 # Kill-switch: if this file exists, do nothing (Mac may sleep normally).
 [ -e "$STATE_DIR/disabled" ] && exit 0
 
-# AskUserQuestion pause is dispatched by hooks.json (PreToolUse with matcher
-# "AskUserQuestion" → pause-awake.sh, declared after this script). Declaration
-# order in hooks.json determines run order: keep-awake.sh clears the marker
-# first, pause-awake.sh sets it second. Net result: paused.
+# AskUserQuestion blocks waiting for the user with no Notification event (unlike
+# permission prompts / plan approval). Dispatch inline: a parallel matcher hook
+# raced with our marker-clear below (this script runs the lock/daemon path and
+# finishes ~30ms after pause-awake.sh's instant `: > marker`, so the clear won).
+# Closing-quote in the substring rules out "AskUserQuestionFoo"; requiring both
+# event and tool name rules out unrelated Bash args containing the literal.
+if [[ $HOOK_INPUT == *'"hook_event_name":"PreToolUse"'* \
+   && $HOOK_INPUT == *'"tool_name":"AskUserQuestion"'* ]]; then
+  exec bash "$PLUGIN_DIR/scripts/pause-awake.sh"
+fi
 
 SESSIONS_DIR="$STATE_DIR/sessions"
 PAUSED_DIR="$STATE_DIR/paused"

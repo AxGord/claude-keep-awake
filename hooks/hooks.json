@@ -18,15 +18,6 @@
             "command": "bash ${CLAUDE_PLUGIN_ROOT}/scripts/keep-awake.sh"
           }
         ]
-      },
-      {
-        "matcher": "AskUserQuestion",
-        "hooks": [
-          {
-            "type": "command",
-            "command": "bash ${CLAUDE_PLUGIN_ROOT}/scripts/pause-awake.sh"
-          }
-        ]
       }
     ],
     "Notification": [
