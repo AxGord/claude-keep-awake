@@ -12,6 +12,7 @@ import IOKit
 import IOKit.pwr_mgt
 import IOKit.ps
 import CoreGraphics
+import Network
 
 let LOG_PATH = "/tmp/keep-awake-daemon.log"
 let SOUND_CLOSE = "/System/Library/Sounds/Bottle.aiff"
@@ -35,6 +36,10 @@ let HOOK_IDLE_LIMIT: TimeInterval = 7200  // 2h
 // AC plug-in on Apple Silicon causes a brief forced sleep (kernel bug, no userspace fix).
 // Mark the lid as unsafe-to-close for this window so a statusline can warn the user.
 let UNSAFE_LID_WINDOW_SEC: TimeInterval = 20
+// Claude can't reach the API without internet, so holding sleep-prevention is wasted
+// once the route goes away. Wait this long before releasing — survives brief flaps
+// (Wi-Fi roam, captive-portal reauth) without thrashing assertions.
+let NETWORK_GRACE_SEC: TimeInterval = 30
 
 // ---------- logging ----------
 let logFmt: ISO8601DateFormatter = {
@@ -128,6 +133,24 @@ func reapplyPower() {
     setClamshellSleep(disable: true)
 }
 
+// ---------- network availability ----------
+// Optimistic default at boot: NWPathMonitor fires its first callback within
+// milliseconds of start(), so a real `false` overrides this almost immediately;
+// the `true` default just avoids a release→reacquire flicker on cold start.
+// Mutated only on the main queue (network handler dispatches there).
+var networkPathSatisfied: Bool = true
+var networkLostSince: Date? = nil
+var pathMonitor: NWPathMonitor? = nil
+
+// Available iff currently satisfied OR the unsatisfied-for window hasn't elapsed.
+// Lazy grace: no separate timer — pollTimer's 1 Hz updateHold() picks up the
+// expiry edge within ≤1 s.
+func isNetworkAvailable() -> Bool {
+    if networkPathSatisfied { return true }
+    guard let since = networkLostSince else { return true }
+    return Date().timeIntervalSince(since) < NETWORK_GRACE_SEC
+}
+
 // ---------- per-session pause ----------
 // A session is active iff its PID is alive AND it has no paused/<PID> marker.
 // Session filename == PID string (keep-awake.sh); marker filename matches.
@@ -144,17 +167,21 @@ func hasActiveSession() -> Bool {
     return false
 }
 
-// Hold sleep-prevention iff some session is working. Releasing also drops the
-// active sleep veto (see kIOMessageCanSystemSleep_raw) so the OS may sleep.
+// Hold sleep-prevention iff some session is working AND the route is up
+// (or within the offline grace). Releasing also drops the active sleep veto
+// (see kIOMessageCanSystemSleep_raw) so the OS may sleep.
 func updateHold() {
-    let want = hasActiveSession()
+    let activeSession = hasActiveSession()
+    let netUp = isNetworkAvailable()
+    let want = activeSession && netUp
     if want == assertionsHeld { return }
     assertionsHeld = want
     if want {
-        log("session resumed → re-acquiring")
+        log("hold acquired (session active, network up) → re-acquiring")
         reapplyPower()
     } else {
-        log("all sessions paused → releasing")
+        let reason = !activeSession ? "all sessions paused" : "network offline >\(Int(NETWORK_GRACE_SEC))s"
+        log("\(reason) → releasing")
         releaseAssertions()
         setClamshellSleep(disable: false)
     }
@@ -246,6 +273,39 @@ func closeSystemPowerNotifications() {
     if rootPowerNotifier != 0 { IODeregisterForSystemPower(&rootPowerNotifier); rootPowerNotifier = 0 }
     if let port = rootPowerNotifyPort { IONotificationPortDestroy(port); rootPowerNotifyPort = nil }
     if rootPowerPort != 0 { IOServiceClose(rootPowerPort); rootPowerPort = 0 }
+}
+
+// ---------- NWPathMonitor (route availability) ----------
+// Event-driven default-route observer — no polling, no ICMP. Callback runs on
+// its own queue; bounce to main so all network/hold state is touched from one
+// thread. On loss we don't release immediately: the pollTimer's updateHold()
+// detects the grace expiry on the next tick. On restore we trigger updateHold()
+// inline so re-acquisition is instant.
+func setupNetworkMonitor() {
+    let monitor = NWPathMonitor()
+    pathMonitor = monitor
+    monitor.pathUpdateHandler = { path in
+        let satisfied = (path.status == .satisfied)
+        DispatchQueue.main.async {
+            if satisfied == networkPathSatisfied { return }
+            networkPathSatisfied = satisfied
+            if satisfied {
+                networkLostSince = nil
+                log("network: up")
+                updateHold()
+            } else {
+                networkLostSince = Date()
+                log("network: down — grace \(Int(NETWORK_GRACE_SEC))s")
+            }
+        }
+    }
+    monitor.start(queue: DispatchQueue(label: "network-monitor"))
+    log("network monitor: started")
+}
+
+func closeNetworkMonitor() {
+    pathMonitor?.cancel()
+    pathMonitor = nil
 }
 
 // ---------- DisplayServices brightness (private framework via dlopen) ----------
@@ -363,6 +423,7 @@ func cleanup() {
     releaseAssertions()
     closeClamshellHandles()
     closeSystemPowerNotifications()
+    closeNetworkMonitor()
     // remove our pid file if it still points to us
     if let pidStr = try? String(contentsOfFile: DAEMON_PID_FILE, encoding: .utf8),
        Int32(pidStr.trimmingCharacters(in: .whitespacesAndNewlines)) == getpid() {
@@ -396,6 +457,7 @@ log("initial AC state: \(wasOnAC)")
 createAssertions()
 setClamshellSleep(disable: true)
 setupSystemPowerNotifications()
+setupNetworkMonitor()
 
 var lastLidClosed = readLidClosed()
 log("initial lid closed: \(lastLidClosed)")
@@ -405,14 +467,26 @@ pollTimer.schedule(deadline: .now() + 1.0, repeating: 1.0)
 pollTimer.setEventHandler {
     let cur = readLidClosed()
     if cur != lastLidClosed {
+        // Chime + dim/restore are keep-awake-mode workarounds (audible confirmation
+        // that the override is active; brightness=0 nudges macOS to actually sleep
+        // on battery). When released, the system is taking the normal sleep path —
+        // they would just startle the user mid-sleep.
         if cur {
-            log("lid closed → Bottle")
-            playSound(SOUND_CLOSE)
-            dimBuiltin()
+            if assertionsHeld {
+                log("lid closed → Bottle")
+                playSound(SOUND_CLOSE)
+                dimBuiltin()
+            } else {
+                log("lid closed (released, skipping chime/dim)")
+            }
         } else {
-            log("lid opened → Submarine")
-            playSound(SOUND_OPEN)
-            restoreBuiltin()
+            if assertionsHeld {
+                log("lid opened → Submarine")
+                playSound(SOUND_OPEN)
+                restoreBuiltin()
+            } else {
+                log("lid opened (released, skipping chime/restore)")
+            }
         }
     }
     lastLidClosed = cur
