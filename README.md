@@ -9,9 +9,11 @@ A [Claude Code](https://docs.anthropic.com/en/docs/claude-code) plugin that prev
 
 - Activates on prompt submit / tool use, releases on session end
 - **Releases while Claude waits for you** — a session blocked on a permission prompt, `AskUserQuestion`, or plan approval stops requesting wake (per-session: other working sessions still keep the Mac awake)
+- **Stays awake across background tasks** — a tool launched with `run_in_background` outlives the turn (Claude's `Stop` fires while it still runs); the session stays registered until the task's completion revives Claude, so the Mac isn't released mid-task
+- **Releases when the internet is gone** — macOS daemon watches the default route via `NWPathMonitor`; after 30 s offline the Mac is allowed to sleep (Claude can't reach the API anyway). Resumes instantly on reconnect.
 - **One shared daemon per machine** — multiple Claude Code sessions reference-count automatically
 - **macOS Apple Silicon: stays awake with the lid closed** without an external display, without `sudo`, without code-signing
-- Audible lid feedback on macOS — Submarine on close, Bottle on open
+- Audible lid feedback on macOS — Bottle on close, Submarine on open (only while keep-awake is actively overriding the lid; silent when the Mac is taking the normal sleep path)
 - Self-monitor: daemon exits if all registered sessions die (covers Claude Code crashes), or if no hook fires for 2h (covers a hung-but-alive CLI)
 - Cross-platform: macOS, Linux (systemd / gnome-session), Windows (Git Bash + PowerShell)
 
@@ -32,11 +34,15 @@ claude plugin add ./claude-keep-awake
 
 Three coordinated pieces:
 
-1. **`scripts/keep-awake.sh`** — fires on every `UserPromptSubmit`, `PreToolUse`, and `PostToolUse` hook. Registers the current session in `~/.claude/keep-awake-state/sessions/<cli-pid>`, clears any pause marker for it, and starts a daemon if none is running. Sessions are keyed by the Claude CLI process PID (stable for the process lifetime), not `session_id` (which changes on `/clear`, `/compact`, resume — UUID keying leaked one file per session_id that `Stop` never reaped).
+1. **`scripts/keep-awake.sh`** — fires on every `UserPromptSubmit`, `PreToolUse`, and `PostToolUse` hook. Registers the current session in `~/.claude/keep-awake-state/sessions/<cli-pid>`, clears any pause marker for it, and starts a daemon if none is running. Sessions are keyed by the Claude CLI process PID (stable for the process lifetime), not `session_id` (which changes on `/clear`, `/compact`, resume — UUID keying leaked one file per session_id that `Stop` never reaped). A `PreToolUse` carrying `run_in_background:true` also writes `~/.claude/keep-awake-state/bg/<cli-pid>`, marking that a background task will outlive the turn; `UserPromptSubmit` — the first hook fired when the task's completion revives Claude — clears it.
 2. **`scripts/pause-awake.sh`** — fires on the `Notification` hook (Claude needs a permission, or has been idle waiting for input ≥60s). `AskUserQuestion` blocks waiting for the user but (unlike permission prompts / plan approval) emits no `Notification` event, so `keep-awake.sh` inspects its stdin JSON on `PreToolUse` and execs `pause-awake.sh` inline when `tool_name` is `AskUserQuestion` — splitting it into a parallel matcher entry in `hooks.json` raced with `keep-awake.sh`'s marker-clear and never stuck. Writes `~/.claude/keep-awake-state/paused/<cli-pid>`, marking that this session is *not* working. The daemon stops preventing sleep only when **every** live session is paused; any session still working keeps the Mac awake. The next `keep-awake.sh` hook (resume) removes the marker.
-3. **`scripts/stop-awake.sh`** — fires on the `Stop` hook. Removes the session file (and its pause marker). If it was the last live session, terminates the daemon.
+3. **`scripts/stop-awake.sh`** — fires on the `Stop` hook. Unless the session has a pending background-task marker (then it's left registered until completion revives Claude), removes the session file (and its pause marker). If it was the last live session, terminates the daemon.
 
 **Pause/resume latency**: pausing is immediate on a permission prompt or `AskUserQuestion`, ~60s on pure idle (Claude Code's built-in idle-notification threshold) — after which the OS's normal sleep timers apply. Resuming is ≤1s (the daemon polls at 1 Hz) after the first hook fires on your answer; pauses shorter than a minute never cause an actual sleep since idle-sleep timers are minutes.
+
+**Background tasks**: when Claude launches a tool with `run_in_background` and then has nothing left to do, the turn ends and `Stop` fires *while the task is still running* — without the `bg` marker the session would be unregistered and (if it were the last one) the daemon killed, letting the Mac sleep mid-task. The marker holds it; the task's completion revives Claude with `UserPromptSubmit`, which clears the marker so the next genuine `Stop` releases normally. One caveat: the marker is a flag, not a counter — with several concurrent background tasks the first completion clears it, so if Claude then idles while others still run, those revert to the unmarked behavior (no regression versus not tracking at all, just partial coverage). Precise refcounting isn't possible — Claude Code exposes no per-task completion hook.
+
+**Network-loss release** (macOS Swift daemon only): the daemon registers an `NWPathMonitor` for the default route. When the route goes unsatisfied (Wi-Fi off, Ethernet unplugged, no usable interface) the daemon waits 30 s — to ride out brief flaps like Wi-Fi roam or captive-portal reauth — then releases assertions and re-enables clamshell sleep, exactly as if every session had paused. On the next satisfied path it re-acquires immediately. Holding sleep-prevention while Claude can't reach the API would just burn battery, so this trades a brief offline grace for letting the Mac sleep when it should.
 
 **Kill-switch**: create `~/.claude/keep-awake-state/disabled` to make the hooks a no-op (Mac sleeps normally); delete it to resume. Takes effect on the next hook in any active session.
 
@@ -64,11 +70,13 @@ Main loop is `CFRunLoopRun()` (not `dispatchMain()`) so CFRunLoop sources used b
 
 To warn the user *before* they close the lid in this unsafe window, the daemon writes `~/.claude/keep-awake-state/lid-unsafe-until` (UNIX timestamp) on AC plug-in and removes it when full wake completes. Use the `scripts/statusline-keep-awake.sh` snippet in your Claude Code statusLine to display a countdown — see "Statusline integration" below.
 
-When you close the lid:
+When you close the lid **with keep-awake active**:
 - The built-in display brightness is set to 0 via the private `DisplayServices` framework (backlight off)
 - The system stays at full clock; Claude Code processes do not get throttled
-- An audible **Submarine** chime confirms the keep-awake is active
-- On open, **Bottle** chime confirms normal operation resumed; brightness fades back to its saved value over ~500ms (minimum restore floor 0.05 if saved was lower)
+- An audible **Bottle** chime confirms the keep-awake is active
+- On open, **Submarine** chime confirms normal operation resumed; brightness fades back to its saved value over ~500ms (minimum restore floor 0.05 if saved was lower)
+
+When you close the lid **while keep-awake is released** (no active session, or network has been offline >30 s), the daemon skips the chime and the brightness override — the Mac takes the normal sleep path and you won't hear anything.
 
 If `swiftc` is not available, the plugin falls back to plain `caffeinate -dis` — that still prevents idle sleep, but lid-close on Apple Silicon will throw the system into DarkWake (network limited, processes throttled).
 

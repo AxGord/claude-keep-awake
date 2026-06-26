@@ -10,6 +10,7 @@ PARENT_PID="${PPID:-$$}"
 STATE_DIR="${HOME}/.claude/keep-awake-state"
 SESSIONS_DIR="$STATE_DIR/sessions"
 PAUSED_DIR="$STATE_DIR/paused"
+BG_DIR="$STATE_DIR/bg"
 DAEMON_PID_FILE="$STATE_DIR/daemon.pid"
 LOCK_DIR="$STATE_DIR/.lock"
 
@@ -37,6 +38,12 @@ has_live_sessions() {
 }
 
 acquire_lock
+
+# A background task launched this turn outlives it (keep-awake.sh marked it).
+# Keep the session registered so the daemon holds the Mac awake until the task's
+# completion revives Claude, which clears the marker via UserPromptSubmit.
+[ -e "$BG_DIR/$PARENT_PID" ] && exit 0  # trap releases the lock
+
 rm -f "$SESSIONS_DIR/$PARENT_PID"
 rm -f "$PAUSED_DIR/$PARENT_PID"
 
