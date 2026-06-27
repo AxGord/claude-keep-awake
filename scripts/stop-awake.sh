@@ -27,11 +27,26 @@ acquire_lock() {
 release_lock() { rmdir "$LOCK_DIR" 2>/dev/null || true; }
 trap release_lock EXIT
 
+# A session PID counts as live only if the process exists AND is still a
+# `claude` process. A bare kill -0 also passes when the OS recycles a dead
+# session's PID to an unrelated process (observed: AudioComponentRegistrar) —
+# that phantom would otherwise keep the daemon awake forever. Process name is
+# overridable (KEEP_AWAKE_PROC_NAME) for tests and non-native installs.
+SESSION_PROC_NAME="${KEEP_AWAKE_PROC_NAME:-claude}"
+session_pid_live() {
+  local pid="$1"
+  [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null || return 1
+  case "$(ps -p "$pid" -o comm= 2>/dev/null)" in
+    */"$SESSION_PROC_NAME"|"$SESSION_PROC_NAME") return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
 has_live_sessions() {
   for f in "$SESSIONS_DIR"/*; do
     [ -e "$f" ] || continue
     local pid; pid=$(cat "$f" 2>/dev/null) || continue
-    [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null && return 0
+    session_pid_live "$pid" && return 0
     rm -f "$f"
   done
   return 1

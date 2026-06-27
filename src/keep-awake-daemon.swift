@@ -26,6 +26,10 @@ let SESSIONS_DIR = "\(STATE_DIR)/sessions"
 // user (permission prompt, AskUserQuestion, plan approval). keep-awake.sh
 // removes it on the next hook. A session is "active" only if it has no marker.
 let PAUSED_DIR = "\(STATE_DIR)/paused"
+// A session PID is honored only while it remains a process of this name. Guards
+// against PID reuse: a recycled PID passes kill(0) but is no longer claude.
+// Overridable (KEEP_AWAKE_PROC_NAME) for tests and non-native installs.
+let SESSION_PROC_NAME = ProcessInfo.processInfo.environment["KEEP_AWAKE_PROC_NAME"] ?? "claude"
 let DAEMON_PID_FILE = "\(STATE_DIR)/daemon.pid"
 let LID_UNSAFE_FILE = "\(STATE_DIR)/lid-unsafe-until"
 let EMPTY_GRACE_SEC: TimeInterval = 300  // exit after 5 min with no sessions
@@ -151,6 +155,17 @@ func isNetworkAvailable() -> Bool {
     return Date().timeIntervalSince(since) < NETWORK_GRACE_SEC
 }
 
+// A PID counts as a live session only if it's still a SESSION_PROC_NAME process.
+// A bare kill(pid,0) also passes after the OS recycles a dead session's PID to an
+// unrelated process (observed: AudioComponentRegistrar), which would pin the
+// daemon forever — and since bash hooks only run while a real session is active,
+// the daemon itself must reject the phantom. proc_name returns the short comm.
+func pidIsClaude(_ pid: pid_t) -> Bool {
+    var buf = [CChar](repeating: 0, count: 256)
+    guard proc_name(pid, &buf, UInt32(buf.count)) > 0 else { return false }
+    return String(cString: buf) == SESSION_PROC_NAME
+}
+
 // ---------- per-session pause ----------
 // A session is active iff its PID is alive AND it has no paused/<PID> marker.
 // Session filename == PID string (keep-awake.sh); marker filename matches.
@@ -160,7 +175,7 @@ func hasActiveSession() -> Bool {
         guard let content = try? String(contentsOfFile: "\(SESSIONS_DIR)/\(f)", encoding: .utf8),
               let pid = Int32(content.trimmingCharacters(in: .whitespacesAndNewlines))
         else { continue }
-        if kill(pid, 0) != 0 { continue }                                           // dead
+        if kill(pid, 0) != 0 || !pidIsClaude(pid) { continue }                      // dead or PID reused
         if FileManager.default.fileExists(atPath: "\(PAUSED_DIR)/\(f)") { continue } // paused
         return true
     }
@@ -548,8 +563,8 @@ monitorTimer.setEventHandler {
         guard let content = try? String(contentsOfFile: "\(SESSIONS_DIR)/\(f)", encoding: .utf8),
               let pid = Int32(content.trimmingCharacters(in: .whitespacesAndNewlines))
         else { continue }
-        if kill(pid, 0) == 0 { anyAlive = true }
-        else { try? FileManager.default.removeItem(atPath: "\(PAUSED_DIR)/\(f)") }  // dead → reap marker
+        if kill(pid, 0) == 0 && pidIsClaude(pid) { anyAlive = true }
+        else { try? FileManager.default.removeItem(atPath: "\(PAUSED_DIR)/\(f)") }  // dead/reused → reap marker
     }
     if anyAlive { return }
     log("all registered sessions dead → self-exit")

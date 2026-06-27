@@ -17,6 +17,9 @@ SCRIPTS="$ROOT/scripts"
 FAIL=0
 
 HOME="$(mktemp -d)"; export HOME
+# Sessions here are keyed by this test's bash PID, not a `claude` process, so the
+# PID-identity guard would otherwise reap them. Tell the scripts to expect bash.
+export KEEP_AWAKE_PROC_NAME=bash
 ST="$HOME/.claude/keep-awake-state"
 BG="$ST/bg/$$"
 SESS="$ST/sessions/$$"
