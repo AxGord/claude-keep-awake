@@ -159,11 +159,25 @@ func isNetworkAvailable() -> Bool {
 // A bare kill(pid,0) also passes after the OS recycles a dead session's PID to an
 // unrelated process (observed: AudioComponentRegistrar), which would pin the
 // daemon forever — and since bash hooks only run while a real session is active,
-// the daemon itself must reject the phantom. proc_name returns the short comm.
+// the daemon itself must reject the phantom.
+//
+// Identity is `ps -o comm=` (argv[0]), matching the bash hooks' check exactly so
+// there is one definition of "a claude process". proc_name()/p_comm is unusable:
+// the claude CLI overwrites p_comm with its version (e.g. "2.1.193"), which never
+// equals SESSION_PROC_NAME, so the daemon self-exited while real sessions ran.
 func pidIsClaude(_ pid: pid_t) -> Bool {
-    var buf = [CChar](repeating: 0, count: 256)
-    guard proc_name(pid, &buf, UInt32(buf.count)) > 0 else { return false }
-    return String(cString: buf) == SESSION_PROC_NAME
+    let task = Process()
+    task.launchPath = "/bin/ps"
+    task.arguments = ["-p", "\(pid)", "-o", "comm="]
+    let pipe = Pipe()
+    task.standardOutput = pipe
+    task.standardError = FileHandle.nullDevice
+    do { try task.run() } catch { return false }
+    let data = pipe.fileHandleForReading.readDataToEndOfFile()
+    task.waitUntilExit()
+    let comm = String(data: data, encoding: .utf8)?
+        .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+    return comm == SESSION_PROC_NAME || comm.hasSuffix("/\(SESSION_PROC_NAME)")
 }
 
 // ---------- per-session pause ----------
