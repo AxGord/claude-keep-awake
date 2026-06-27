@@ -39,10 +39,25 @@ has_live_sessions() {
 
 acquire_lock
 
-# A background task launched this turn outlives it (keep-awake.sh marked it).
-# Keep the session registered so the daemon holds the Mac awake until the task's
-# completion revives Claude, which clears the marker via UserPromptSubmit.
-[ -e "$BG_DIR/$PARENT_PID" ] && exit 0  # trap releases the lock
+# A background task launched this (or a prior) turn outlives it. keep-awake.sh
+# recorded each task's output file; Claude holds that file open for the task's
+# whole lifetime, so lsof tells us which are still running. Keep the session
+# registered while any is; prune finished ones so the marker drains to empty and
+# the session unregisters on the Stop that follows the last task's completion —
+# not on a user prompt that may never come.
+BG_MARKER="$BG_DIR/$PARENT_PID"
+if [ -e "$BG_MARKER" ]; then
+  remaining=""
+  while IFS= read -r task_out; do
+    [ -n "$task_out" ] || continue
+    lsof "$task_out" >/dev/null 2>&1 && remaining+="$task_out"$'\n'
+  done < "$BG_MARKER"
+  if [ -n "$remaining" ]; then
+    printf '%s' "$remaining" > "$BG_MARKER"  # drop finished tasks, keep running ones
+    exit 0  # task still running → keep session; trap releases the lock
+  fi
+  rm -f "$BG_MARKER"  # all tasks finished → fall through to unregister
+fi
 
 rm -f "$SESSIONS_DIR/$PARENT_PID"
 rm -f "$PAUSED_DIR/$PARENT_PID"

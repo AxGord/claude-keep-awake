@@ -132,15 +132,22 @@ rm -f "$PAUSED_DIR/$PARENT_PID"  # resume: a hook fired → Claude is working ag
 # Background-task tracking. A tool launched with run_in_background outlives the
 # turn: Claude ends the turn (Stop fires) while the task still runs, then is
 # revived by its completion. Without this, stop-awake.sh would unregister the
-# session — releasing the Mac mid-task. Mark the session on launch so Stop keeps
-# it; clear on UserPromptSubmit, the first hook of the revival/next turn (Stop
-# carries no PreToolUse, and PostToolUse fires at launch, not completion).
-if [[ $HOOK_INPUT == *'"hook_event_name":"UserPromptSubmit"'* ]]; then
-  rm -f "$BG_DIR/$PARENT_PID"
-elif [[ $HOOK_INPUT == *'"hook_event_name":"PreToolUse"'* \
-     && $HOOK_INPUT == *'"run_in_background":true'* ]]; then
-  mkdir -p "$BG_DIR"
-  : > "$BG_DIR/$PARENT_PID"
+# session — releasing the Mac mid-task. The revival fires no reliable hook (task
+# completion is injected as a notification, not a UserPromptSubmit), so a marker
+# cleared only on the next prompt leaked: a user who walked away after launching
+# a task pinned the Mac awake until the 2h watchdog. Instead, tie the marker to
+# the task itself. PostToolUse fires at launch and its tool_response carries the
+# task's output file; Claude holds that file open for the task's whole lifetime,
+# so stop-awake.sh can probe liveness with lsof. Record one output path per line.
+if [[ $HOOK_INPUT == *'"hook_event_name":"PostToolUse"'* \
+   && $HOOK_INPUT == *'"run_in_background":true'* ]]; then
+  # Anchor on Claude's literal "written to: <path>" so a /tasks/*.output path
+  # appearing in the command text itself can't be mistaken for the task's file.
+  task_out=$(printf '%s' "$HOOK_INPUT" | sed -nE 's/.*written to: (\/[^"[:space:]]+\.output).*/\1/p' | head -1)
+  if [ -n "$task_out" ]; then
+    mkdir -p "$BG_DIR"
+    printf '%s\n' "$task_out" >> "$BG_DIR/$PARENT_PID"
+  fi
 fi
 
 reap_dead_sessions
