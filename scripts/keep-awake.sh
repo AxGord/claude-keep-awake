@@ -32,6 +32,7 @@ fi
 SESSIONS_DIR="$STATE_DIR/sessions"
 PAUSED_DIR="$STATE_DIR/paused"
 BG_DIR="$STATE_DIR/bg"
+TRANSCRIPTS_DIR="$STATE_DIR/transcripts"
 DAEMON_PID_FILE="$STATE_DIR/daemon.pid"
 LOCK_DIR="$STATE_DIR/.lock"
 
@@ -79,6 +80,7 @@ reap_dead_sessions() {
       rm -f "$f"
       rm -f "$PAUSED_DIR/${pid:-$(basename "$f")}"
       rm -f "$BG_DIR/${pid:-$(basename "$f")}"
+      rm -f "$TRANSCRIPTS_DIR/${pid:-$(basename "$f")}"
     fi
   done
 }
@@ -143,6 +145,18 @@ start_daemon() {
 acquire_lock
 echo "$PARENT_PID" > "$SESSIONS_DIR/$PARENT_PID"
 rm -f "$PAUSED_DIR/$PARENT_PID"  # resume: a hook fired → Claude is working again
+
+# Record the transcript path so the daemon can spot an interrupted turn: Esc
+# fires no Stop/Notification, but Claude Code appends "[Request interrupted by
+# user]" to the transcript. The daemon releases the Mac when that is the last
+# message. Refreshed every hook (transcript path changes on /clear, /compact).
+# First match only: the top-level transcript_path precedes any nested one a
+# tool_response might contain (greedy sed would pick the wrong, last one).
+tpath=$(printf '%s' "$HOOK_INPUT" | grep -oE '"transcript_path":"[^"]+"' | head -1 | sed -E 's/.*:"([^"]+)"/\1/')
+if [ -n "$tpath" ]; then
+  mkdir -p "$TRANSCRIPTS_DIR"
+  printf '%s\n' "$tpath" > "$TRANSCRIPTS_DIR/$PARENT_PID"
+fi
 
 # Background-task tracking. A tool launched with run_in_background outlives the
 # turn: Claude ends the turn (Stop fires) while the task still runs, then is

@@ -26,6 +26,16 @@ let SESSIONS_DIR = "\(STATE_DIR)/sessions"
 // user (permission prompt, AskUserQuestion, plan approval). keep-awake.sh
 // removes it on the next hook. A session is "active" only if it has no marker.
 let PAUSED_DIR = "\(STATE_DIR)/paused"
+// keep-awake.sh records each session's transcript path here (transcripts/<PID>).
+// Used to detect an Esc-interrupted turn: it fires no Stop and no Notification,
+// so the session stays registered+unpaused, but Claude Code appends a final
+// "[Request interrupted by user]" message to the transcript.
+let TRANSCRIPTS_DIR = "\(STATE_DIR)/transcripts"
+// Prefix (no closing bracket): Claude Code writes both "[Request interrupted by
+// user]" (Esc while idle/generating) and "[Request interrupted by user for tool
+// use]" (Esc while a tool runs). Matching the prefix catches both.
+let INTERRUPT_MARKER = "[Request interrupted by user"
+let TRANSCRIPT_TAIL_BYTES = 65536  // only the tail is scanned; the marker is the last line
 // A session PID is honored only while it remains a process of this name. Guards
 // against PID reuse: a recycled PID passes kill(0) but is no longer claude.
 // Overridable (KEEP_AWAKE_PROC_NAME) for tests and non-native installs.
@@ -180,6 +190,52 @@ func pidIsClaude(_ pid: pid_t) -> Bool {
     return comm == SESSION_PROC_NAME || comm.hasSuffix("/\(SESSION_PROC_NAME)")
 }
 
+// ---------- interrupted-turn detection ----------
+// An Esc-interrupted turn fires no Stop and no Notification, so the session
+// stays registered and unpaused and would hold the Mac until the 2h watchdog.
+// But Claude Code records the abort in the transcript as a final user message
+// "[Request interrupted by user]". A genuinely running foreground tool is NOT
+// confused for this: its tool_use line is written at tool START, so a live tool
+// leaves a trailing tool_use with no matching tool_result — never the marker.
+// So this never releases the Mac out from under a real long-running tool.
+func messageIsInterrupt(_ msg: [String: Any]) -> Bool {
+    if let s = msg["content"] as? String { return s.contains(INTERRUPT_MARKER) }
+    if let parts = msg["content"] as? [[String: Any]] {
+        for p in parts where (p["type"] as? String) == "text" {
+            if let t = p["text"] as? String, t.contains(INTERRUPT_MARKER) { return true }
+        }
+    }
+    return false
+}
+
+// True iff the session's transcript ends with an interrupt marker (last
+// user/assistant message). Reads only the tail; metadata/partial lines are
+// skipped, so the first complete message scanned from the end decides.
+func sessionInterrupted(_ name: String) -> Bool {
+    guard let raw = try? String(contentsOfFile: "\(TRANSCRIPTS_DIR)/\(name)", encoding: .utf8)
+    else { return false }
+    let path = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+    guard !path.isEmpty,
+          let size = (try? FileManager.default.attributesOfItem(atPath: path))?[.size] as? Int,
+          let fh = FileHandle(forReadingAtPath: path)
+    else { return false }
+    defer { try? fh.close() }
+    if size > TRANSCRIPT_TAIL_BYTES { fh.seek(toFileOffset: UInt64(size - TRANSCRIPT_TAIL_BYTES)) }
+    // Lossy decode: the tail may start mid-codepoint, which would make a strict
+    // decode return nil for the whole buffer. The mangled leading partial line
+    // fails JSON parse and is skipped anyway.
+    let text = String(decoding: fh.readDataToEndOfFile(), as: UTF8.self)
+    for line in text.split(separator: "\n").reversed() {
+        guard let ld = String(line).data(using: .utf8),
+              let obj = try? JSONSerialization.jsonObject(with: ld) as? [String: Any],
+              let type = obj["type"] as? String, type == "user" || type == "assistant",
+              let msg = obj["message"] as? [String: Any]
+        else { continue }                                    // metadata / partial line → skip
+        return messageIsInterrupt(msg)                       // last real message decides
+    }
+    return false
+}
+
 // ---------- per-session pause ----------
 // A session is active iff its PID is alive AND it has no paused/<PID> marker.
 // Session filename == PID string (keep-awake.sh); marker filename matches.
@@ -191,6 +247,7 @@ func hasActiveSession() -> Bool {
         else { continue }
         if kill(pid, 0) != 0 || !pidIsClaude(pid) { continue }                      // dead or PID reused
         if FileManager.default.fileExists(atPath: "\(PAUSED_DIR)/\(f)") { continue } // paused
+        if sessionInterrupted(f) { continue }                                        // turn aborted (Esc)
         return true
     }
     return false
@@ -209,7 +266,7 @@ func updateHold() {
         log("hold acquired (session active, network up) → re-acquiring")
         reapplyPower()
     } else {
-        let reason = !activeSession ? "all sessions paused" : "network offline >\(Int(NETWORK_GRACE_SEC))s"
+        let reason = !activeSession ? "no active session (paused/interrupted)" : "network offline >\(Int(NETWORK_GRACE_SEC))s"
         log("\(reason) → releasing")
         releaseAssertions()
         setClamshellSleep(disable: false)
