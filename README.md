@@ -19,15 +19,20 @@ A [Claude Code](https://docs.anthropic.com/en/docs/claude-code) plugin that prev
 
 ## Quick Start
 
-```
-claude plugin add claude-keep-awake
-```
-
-Or manually:
+Install from the official [community marketplace](https://github.com/anthropics/claude-plugins-community):
 
 ```bash
-git clone https://github.com/AxGord/claude-keep-awake.git
-claude plugin add ./claude-keep-awake
+claude plugin marketplace add anthropics/claude-plugins-community
+claude plugin install keep-awake@claude-community
+```
+
+(or inside Claude Code: `/plugin install keep-awake@claude-community`)
+
+Or straight from this repo:
+
+```bash
+claude plugin marketplace add AxGord/claude-keep-awake
+claude plugin install keep-awake@claude-keep-awake
 ```
 
 ## How It Works

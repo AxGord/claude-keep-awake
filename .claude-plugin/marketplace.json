@@ -1,0 +1,18 @@
+{
+  "name": "claude-keep-awake",
+  "owner": {
+    "name": "AxGord",
+    "email": "axgord@gmail.com",
+    "url": "https://github.com/AxGord"
+  },
+  "metadata": {
+    "description": "Direct-install marketplace for the keep-awake plugin"
+  },
+  "plugins": [
+    {
+      "name": "keep-awake",
+      "source": "./",
+      "description": "Prevents your computer from sleeping while Claude Code is working; on Apple Silicon also blocks lid-close sleep (no sudo, no entitlements). macOS / Linux / Windows."
+    }
+  ]
+}
