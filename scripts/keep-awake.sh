@@ -32,6 +32,7 @@ fi
 SESSIONS_DIR="$STATE_DIR/sessions"
 PAUSED_DIR="$STATE_DIR/paused"
 BG_DIR="$STATE_DIR/bg"
+TRANSCRIPTS_DIR="$STATE_DIR/transcripts"
 DAEMON_PID_FILE="$STATE_DIR/daemon.pid"
 LOCK_DIR="$STATE_DIR/.lock"
 
@@ -56,14 +57,30 @@ daemon_alive() {
   [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null
 }
 
+# A session PID counts as live only if the process exists AND is still a
+# `claude` process. A bare kill -0 also passes when the OS recycles a dead
+# session's PID to an unrelated process (observed: AudioComponentRegistrar) —
+# that phantom would otherwise keep the daemon awake forever. Process name is
+# overridable (KEEP_AWAKE_PROC_NAME) for tests and non-native installs.
+SESSION_PROC_NAME="${KEEP_AWAKE_PROC_NAME:-claude}"
+session_pid_live() {
+  local pid="$1"
+  [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null || return 1
+  case "$(ps -p "$pid" -o comm= 2>/dev/null)" in
+    */"$SESSION_PROC_NAME"|"$SESSION_PROC_NAME") return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
 reap_dead_sessions() {
   for f in "$SESSIONS_DIR"/*; do
     [ -e "$f" ] || continue
     local pid; pid=$(cat "$f" 2>/dev/null) || true
-    if [ -z "$pid" ] || ! kill -0 "$pid" 2>/dev/null; then
+    if ! session_pid_live "$pid"; then
       rm -f "$f"
       rm -f "$PAUSED_DIR/${pid:-$(basename "$f")}"
       rm -f "$BG_DIR/${pid:-$(basename "$f")}"
+      rm -f "$TRANSCRIPTS_DIR/${pid:-$(basename "$f")}"
     fi
   done
 }
@@ -129,18 +146,37 @@ acquire_lock
 echo "$PARENT_PID" > "$SESSIONS_DIR/$PARENT_PID"
 rm -f "$PAUSED_DIR/$PARENT_PID"  # resume: a hook fired → Claude is working again
 
+# Record the transcript path so the daemon can spot an interrupted turn: Esc
+# fires no Stop/Notification, but Claude Code appends "[Request interrupted by
+# user]" to the transcript. The daemon releases the Mac when that is the last
+# message. Refreshed every hook (transcript path changes on /clear, /compact).
+# First match only: the top-level transcript_path precedes any nested one a
+# tool_response might contain (greedy sed would pick the wrong, last one).
+tpath=$(printf '%s' "$HOOK_INPUT" | grep -oE '"transcript_path":"[^"]+"' | head -1 | sed -E 's/.*:"([^"]+)"/\1/')
+if [ -n "$tpath" ]; then
+  mkdir -p "$TRANSCRIPTS_DIR"
+  printf '%s\n' "$tpath" > "$TRANSCRIPTS_DIR/$PARENT_PID"
+fi
+
 # Background-task tracking. A tool launched with run_in_background outlives the
 # turn: Claude ends the turn (Stop fires) while the task still runs, then is
 # revived by its completion. Without this, stop-awake.sh would unregister the
-# session — releasing the Mac mid-task. Mark the session on launch so Stop keeps
-# it; clear on UserPromptSubmit, the first hook of the revival/next turn (Stop
-# carries no PreToolUse, and PostToolUse fires at launch, not completion).
-if [[ $HOOK_INPUT == *'"hook_event_name":"UserPromptSubmit"'* ]]; then
-  rm -f "$BG_DIR/$PARENT_PID"
-elif [[ $HOOK_INPUT == *'"hook_event_name":"PreToolUse"'* \
-     && $HOOK_INPUT == *'"run_in_background":true'* ]]; then
-  mkdir -p "$BG_DIR"
-  : > "$BG_DIR/$PARENT_PID"
+# session — releasing the Mac mid-task. The revival fires no reliable hook (task
+# completion is injected as a notification, not a UserPromptSubmit), so a marker
+# cleared only on the next prompt leaked: a user who walked away after launching
+# a task pinned the Mac awake until the 2h watchdog. Instead, tie the marker to
+# the task itself. PostToolUse fires at launch and its tool_response carries the
+# task's output file; Claude holds that file open for the task's whole lifetime,
+# so stop-awake.sh can probe liveness with lsof. Record one output path per line.
+if [[ $HOOK_INPUT == *'"hook_event_name":"PostToolUse"'* \
+   && $HOOK_INPUT == *'"run_in_background":true'* ]]; then
+  # Anchor on Claude's literal "written to: <path>" so a /tasks/*.output path
+  # appearing in the command text itself can't be mistaken for the task's file.
+  task_out=$(printf '%s' "$HOOK_INPUT" | sed -nE 's/.*written to: (\/[^"[:space:]]+\.output).*/\1/p' | head -1)
+  if [ -n "$task_out" ]; then
+    mkdir -p "$BG_DIR"
+    printf '%s\n' "$task_out" >> "$BG_DIR/$PARENT_PID"
+  fi
 fi
 
 reap_dead_sessions
