@@ -27,9 +27,9 @@ let SESSIONS_DIR = "\(STATE_DIR)/sessions"
 // removes it on the next hook. A session is "active" only if it has no marker.
 let PAUSED_DIR = "\(STATE_DIR)/paused"
 // keep-awake.sh records each session's transcript path here (transcripts/<PID>).
-// Used to detect an Esc-interrupted turn: it fires no Stop and no Notification,
-// so the session stays registered+unpaused, but Claude Code appends a final
-// "[Request interrupted by user]" message to the transcript.
+// Used to detect an aborted turn (Esc interrupt, usage-limit/API-error stop):
+// neither fires Stop or Notification, so the session stays registered+unpaused,
+// but Claude Code appends a recognizable final message to the transcript.
 let TRANSCRIPTS_DIR = "\(STATE_DIR)/transcripts"
 // Prefix (no closing bracket): Claude Code writes both "[Request interrupted by
 // user]" (Esc while idle/generating) and "[Request interrupted by user for tool
@@ -190,14 +190,21 @@ func pidIsClaude(_ pid: pid_t) -> Bool {
     return comm == SESSION_PROC_NAME || comm.hasSuffix("/\(SESSION_PROC_NAME)")
 }
 
-// ---------- interrupted-turn detection ----------
-// An Esc-interrupted turn fires no Stop and no Notification, so the session
-// stays registered and unpaused and would hold the Mac until the 2h watchdog.
-// But Claude Code records the abort in the transcript as a final user message
-// "[Request interrupted by user]". A genuinely running foreground tool is NOT
-// confused for this: its tool_use line is written at tool START, so a live tool
-// leaves a trailing tool_use with no matching tool_result — never the marker.
-// So this never releases the Mac out from under a real long-running tool.
+// ---------- aborted-turn detection ----------
+// Two turn endings fire no Stop and no Notification, so the session stays
+// registered and unpaused and would hold the Mac until the 2h watchdog:
+//  - Esc interrupt: Claude Code records the abort in the transcript as a final
+//    user message "[Request interrupted by user]".
+//  - API-error stop (usage limit / 429 / overloaded / auth): the CLI appends a
+//    synthetic assistant message ("You've hit your session limit · resets ...")
+//    whose transcript line carries top-level "isApiErrorMessage": true. Matching
+//    that flag instead of the banner text covers every error wording. (The 60s
+//    idle Notification does fire after some limit stops, but not after a
+//    limit-refused prompt — observed 2026-07-15 — so it can't be relied on.)
+// A genuinely running foreground tool is NOT confused for either: its tool_use
+// line is written at tool START, so a live tool leaves a trailing tool_use with
+// no matching tool_result — never an abort marker. So this never releases the
+// Mac out from under a real long-running tool.
 func messageIsInterrupt(_ msg: [String: Any]) -> Bool {
     if let s = msg["content"] as? String { return s.contains(INTERRUPT_MARKER) }
     if let parts = msg["content"] as? [[String: Any]] {
@@ -208,10 +215,11 @@ func messageIsInterrupt(_ msg: [String: Any]) -> Bool {
     return false
 }
 
-// True iff the session's transcript ends with an interrupt marker (last
-// user/assistant message). Reads only the tail; metadata/partial lines are
-// skipped, so the first complete message scanned from the end decides.
-func sessionInterrupted(_ name: String) -> Bool {
+// True iff the session's transcript ends with an aborted turn: the last
+// user/assistant message is an Esc-interrupt marker or an API-error stop.
+// Reads only the tail; metadata/partial lines are skipped, so the first
+// complete message scanned from the end decides.
+func sessionTurnAborted(_ name: String) -> Bool {
     guard let raw = try? String(contentsOfFile: "\(TRANSCRIPTS_DIR)/\(name)", encoding: .utf8)
     else { return false }
     let path = raw.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -231,6 +239,7 @@ func sessionInterrupted(_ name: String) -> Bool {
               let type = obj["type"] as? String, type == "user" || type == "assistant",
               let msg = obj["message"] as? [String: Any]
         else { continue }                                    // metadata / partial line → skip
+        if obj["isApiErrorMessage"] as? Bool == true { return true } // limit/API-error stop
         return messageIsInterrupt(msg)                       // last real message decides
     }
     return false
@@ -247,7 +256,7 @@ func hasActiveSession() -> Bool {
         else { continue }
         if kill(pid, 0) != 0 || !pidIsClaude(pid) { continue }                      // dead or PID reused
         if FileManager.default.fileExists(atPath: "\(PAUSED_DIR)/\(f)") { continue } // paused
-        if sessionInterrupted(f) { continue }                                        // turn aborted (Esc)
+        if sessionTurnAborted(f) { continue }                                        // turn aborted (Esc / API error)
         return true
     }
     return false
