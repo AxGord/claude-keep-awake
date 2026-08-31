@@ -78,6 +78,27 @@ start_daemon() {
       return 0
     fi
   fi
+  # Self-terminating backstop for the non-macOS daemons. The Linux and Windows
+  # holders are a bare `sleep 86400` whose only killer is stop-awake.sh on the
+  # Stop hook. If a Claude CLI dies WITHOUT firing Stop (crash, kill -9,
+  # terminal/SSH close, OOM), stop-awake.sh never runs and the holder keeps
+  # suppressing sleep for a full day, reparented to init, with no session alive.
+  # This watchdog polls the session registry and returns once no registered CLI
+  # PID is alive, so the holder can be torn down within ~60s instead of 24h.
+  # (The macOS daemon already self-exits when all sessions die.)
+  export SESSIONS_DIR
+  watchdog='
+    while :; do
+      sleep 60
+      alive=0
+      for f in "$SESSIONS_DIR"/*; do
+        [ -e "$f" ] || continue
+        pid=$(cat "$f" 2>/dev/null) || continue
+        [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null && { alive=1; break; }
+      done
+      [ "$alive" = 0 ] && break
+    done'
+
   case "$(uname -s)" in
     Darwin)
       local bin="$PLUGIN_DIR/bin/keep-awake-daemon"
@@ -102,10 +123,13 @@ start_daemon() {
       fi
       ;;
     Linux)
+      # Hold the inhibitor around the watchdog itself: when the watchdog returns
+      # (no live sessions) bash exits and the inhibit is released. Normal
+      # stop-awake.sh teardown (kill / pkill -P on the recorded PID) still works.
       if command -v systemd-inhibit >/dev/null 2>&1; then
-        nohup systemd-inhibit --what=sleep:idle --who=claude-keep-awake --why=working sleep 86400 </dev/null >/dev/null 2>&1 &
+        nohup systemd-inhibit --what=sleep:idle --who=claude-keep-awake --why=working bash -c "$watchdog" </dev/null >/dev/null 2>&1 &
       elif command -v gnome-session-inhibit >/dev/null 2>&1; then
-        nohup gnome-session-inhibit --inhibit suspend --reason "Claude Code working" sleep 86400 </dev/null >/dev/null 2>&1 &
+        nohup gnome-session-inhibit --inhibit suspend --reason "Claude Code working" bash -c "$watchdog" </dev/null >/dev/null 2>&1 &
       else
         return 0
       fi
@@ -113,12 +137,20 @@ start_daemon() {
       disown $! 2>/dev/null || true
       ;;
     MINGW*|MSYS*|CYGWIN*)
+      # SetThreadExecutionState is per-thread and cleared when the process
+      # exits, so the PowerShell holder must stay alive for the whole stretch.
+      # It can't cheaply poll the (MSYS-namespaced) session PIDs itself, so a
+      # sibling bash watchdog — same PID namespace as stop-awake.sh — kills it
+      # once no session is alive. UNTESTED on Windows; review welcome.
       nohup powershell.exe -NoProfile -WindowStyle Hidden -Command "
         Add-Type -MemberDefinition '[DllImport(\"kernel32.dll\")] public static extern uint SetThreadExecutionState(uint esFlags);' -Name W -Namespace K;
         [K.W]::SetThreadExecutionState([uint32](0x80000000 -bor 0x00000001 -bor 0x00000002));
         Start-Sleep -Seconds 86400
       " </dev/null >/dev/null 2>&1 &
-      echo $! > "$DAEMON_PID_FILE"
+      dpid=$!
+      echo "$dpid" > "$DAEMON_PID_FILE"
+      disown "$dpid" 2>/dev/null || true
+      nohup bash -c "$watchdog"'; kill '"$dpid"' 2>/dev/null' </dev/null >/dev/null 2>&1 &
       disown $! 2>/dev/null || true
       ;;
   esac
