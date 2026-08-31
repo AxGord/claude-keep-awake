@@ -99,6 +99,36 @@ start_daemon() {
       return 0
     fi
   fi
+  # Watchdog for the Linux sleep-inhibitor. Runs alongside the inhibitor and
+  # ends it on either of the conditions the macOS daemon also self-exits on:
+  #   1. no registered CLI PID is alive, or
+  #   2. no hook has touched a session file for KEEP_AWAKE_HOOK_IDLE_LIMIT
+  #      seconds (keep-awake.sh rewrites $SESSIONS_DIR/<pid> on every hook, so an
+  #      active session refreshes it; this also catches a hung CLI and PID reuse).
+  # The Stop hook is the clean teardown; the watchdog covers a CLI that exits
+  # without firing it (crash, kill -9, terminal/SSH close).
+  #
+  # KEEP_AWAKE_HOOK_IDLE_LIMIT is the single knob, shared with the macOS daemon
+  # (which reads the same env var). Default 7200s / 2h; export it so the watchdog
+  # subshell and the Swift daemon both inherit it.
+  export SESSIONS_DIR SESSION_PROC_NAME
+  export -f session_pid_live
+  export KEEP_AWAKE_HOOK_IDLE_LIMIT="${KEEP_AWAKE_HOOK_IDLE_LIMIT:-7200}"
+  watchdog='
+    while :; do
+      sleep 60
+      alive=0 newest=0
+      for f in "$SESSIONS_DIR"/*; do
+        [ -e "$f" ] || continue
+        pid=$(cat "$f" 2>/dev/null) || continue
+        session_pid_live "$pid" && alive=1
+        m=$(stat -c %Y "$f" 2>/dev/null) || m=0
+        [ "$m" -gt "$newest" ] && newest="$m"
+      done
+      [ "$alive" = 0 ] && break
+      [ "$newest" -gt 0 ] && [ $(( $(date +%s) - newest )) -ge "${KEEP_AWAKE_HOOK_IDLE_LIMIT:-7200}" ] && break
+    done'
+
   case "$(uname -s)" in
     Darwin)
       local bin="$PLUGIN_DIR/bin/keep-awake-daemon"
@@ -123,10 +153,13 @@ start_daemon() {
       fi
       ;;
     Linux)
+      # The inhibitor wraps the watchdog: when the loop returns, bash exits and
+      # the inhibit is released. stop-awake.sh (kill / pkill -P the recorded PID)
+      # is the fast path on a clean Stop.
       if command -v systemd-inhibit >/dev/null 2>&1; then
-        nohup systemd-inhibit --what=sleep:idle --who=claude-keep-awake --why=working sleep 86400 </dev/null >/dev/null 2>&1 &
+        nohup systemd-inhibit --what=sleep:idle --who=claude-keep-awake --why=working bash -c "$watchdog" </dev/null >/dev/null 2>&1 &
       elif command -v gnome-session-inhibit >/dev/null 2>&1; then
-        nohup gnome-session-inhibit --inhibit suspend --reason "Claude Code working" sleep 86400 </dev/null >/dev/null 2>&1 &
+        nohup gnome-session-inhibit --inhibit suspend --reason "Claude Code working" bash -c "$watchdog" </dev/null >/dev/null 2>&1 &
       else
         return 0
       fi
