@@ -33,6 +33,7 @@ SESSIONS_DIR="$STATE_DIR/sessions"
 PAUSED_DIR="$STATE_DIR/paused"
 BG_DIR="$STATE_DIR/bg"
 TRANSCRIPTS_DIR="$STATE_DIR/transcripts"
+LIMIT_DIR="$STATE_DIR/limit"
 DAEMON_PID_FILE="$STATE_DIR/daemon.pid"
 LOCK_DIR="$STATE_DIR/.lock"
 
@@ -81,6 +82,7 @@ reap_dead_sessions() {
       rm -f "$PAUSED_DIR/${pid:-$(basename "$f")}"
       rm -f "$BG_DIR/${pid:-$(basename "$f")}"
       rm -f "$TRANSCRIPTS_DIR/${pid:-$(basename "$f")}"
+      rm -f "$LIMIT_DIR/${pid:-$(basename "$f")}"
     fi
   done
 }
@@ -145,6 +147,10 @@ start_daemon() {
 acquire_lock
 echo "$PARENT_PID" > "$SESSIONS_DIR/$PARENT_PID"
 rm -f "$PAUSED_DIR/$PARENT_PID"  # resume: a hook fired → Claude is working again
+# A hook firing also settles a pending usage-limit hold: the session is running
+# again, so the daemon must stop holding for the reset (this is how it learns the
+# CLI's own auto-continue fired, or that the user prompted before the reset).
+rm -f "$LIMIT_DIR/$PARENT_PID"
 
 # Record the transcript path so the daemon can spot an interrupted turn: Esc
 # fires no Stop/Notification, but Claude Code appends "[Request interrupted by
