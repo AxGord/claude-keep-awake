@@ -193,6 +193,8 @@ func isNetworkAvailable() -> Bool {
 // there is one definition of "a claude process". proc_name()/p_comm is unusable:
 // the claude CLI overwrites p_comm with its version (e.g. "2.1.193"), which never
 // equals SESSION_PROC_NAME, so the daemon self-exited while real sessions ran.
+// A backgrounded session runs straight from the installer's versioned binary
+// (…/claude/versions/<ver>) rather than via the `claude` symlink — same CLI.
 func pidIsClaude(_ pid: pid_t) -> Bool {
     let task = Process()
     task.launchPath = "/bin/ps"
@@ -206,6 +208,7 @@ func pidIsClaude(_ pid: pid_t) -> Bool {
     let comm = String(data: data, encoding: .utf8)?
         .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
     return comm == SESSION_PROC_NAME || comm.hasSuffix("/\(SESSION_PROC_NAME)")
+        || comm.contains("/\(SESSION_PROC_NAME)/versions/")
 }
 
 // ---------- aborted-turn detection ----------

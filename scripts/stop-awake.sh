@@ -34,12 +34,14 @@ trap release_lock EXIT
 # session's PID to an unrelated process (observed: AudioComponentRegistrar) —
 # that phantom would otherwise keep the daemon awake forever. Process name is
 # overridable (KEEP_AWAKE_PROC_NAME) for tests and non-native installs.
+# A backgrounded session runs straight from the installer's versioned binary
+# (…/claude/versions/<ver>) rather than via the `claude` symlink — same CLI.
 SESSION_PROC_NAME="${KEEP_AWAKE_PROC_NAME:-claude}"
 session_pid_live() {
   local pid="$1"
   [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null || return 1
   case "$(ps -p "$pid" -o comm= 2>/dev/null)" in
-    */"$SESSION_PROC_NAME"|"$SESSION_PROC_NAME") return 0 ;;
+    */"$SESSION_PROC_NAME"|"$SESSION_PROC_NAME"|*/"$SESSION_PROC_NAME"/versions/*) return 0 ;;
     *) return 1 ;;
   esac
 }

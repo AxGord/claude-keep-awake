@@ -59,7 +59,30 @@ emit stop-awake.sh '{"hook_event_name":"Stop"}'
 chk "has_live_sessions: phantom-only -> phantom reaped" "$SESSIONS/$PHANTOM" absent
 chk "has_live_sessions: phantom-only -> daemon released" "$ST/daemon.pid" absent
 
-kill "$PHANTOM" 2>/dev/null
+# A backgrounded session runs straight from the installer's versioned binary
+# (comm=…/claude/versions/<ver>), not via the `claude` symlink. Stand-in: a
+# process launched as $HOME/bash/versions/9.9.9 must count as a live session.
+mkdir -p "$HOME/bash/versions"
+ln -s /bin/sleep "$HOME/bash/versions/9.9.9"
+"$HOME/bash/versions/9.9.9" 600 & VERSIONED=$!
+disown "$VERSIONED" 2>/dev/null
+echo "  (versioned comm=[$(ps -p "$VERSIONED" -o comm=)])"
+
+# 3. keep-awake.sh's reap keeps the versioned session.
+echo "$VERSIONED" > "$SESSIONS/$VERSIONED"
+neutralize_daemon
+emit keep-awake.sh '{"hook_event_name":"UserPromptSubmit"}'
+chk "reap: versioned-binary session kept" "$SESSIONS/$VERSIONED" exist
+
+# 4. With only the versioned session left, stop-awake keeps the daemon.
+rm -f "$SELF"
+echo "$VERSIONED" > "$SESSIONS/$VERSIONED"
+neutralize_daemon
+emit stop-awake.sh '{"hook_event_name":"Stop"}'
+chk "has_live_sessions: versioned-only -> session kept" "$SESSIONS/$VERSIONED" exist
+chk "has_live_sessions: versioned-only -> daemon kept" "$ST/daemon.pid" exist
+
+kill "$PHANTOM" "$VERSIONED" 2>/dev/null
 [ -n "${DUMMY:-}" ] && kill "$DUMMY" 2>/dev/null
 rm -rf "$HOME"
 exit $FAIL

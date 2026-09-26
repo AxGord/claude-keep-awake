@@ -39,6 +39,7 @@ func newImpl(_ pid: pid_t) -> Bool {
     let comm = String(data: data, encoding: .utf8)?
         .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
     return comm == PROC || comm.hasSuffix("/\(PROC)")
+        || comm.contains("/\(PROC)/versions/")
 }
 
 func psComm(_ pid: pid_t) -> String {
@@ -111,6 +112,21 @@ if (phantomComm as NSString).lastPathComponent == PROC {
     check("phantom (comm=\(phantomComm)) rejected by new impl", newImpl(phantomPid) == false)
 }
 phantom.terminate()
+
+// ---- Scenario C: backgrounded session runs the versioned binary directly ----
+// comm = …/<PROC>/versions/<ver>, not …/<PROC>. A symlinked `sleep` stands in.
+let verDir = NSTemporaryDirectory() + "repro-pid-reuse-\(getpid())/\(PROC)/versions"
+let verBin = verDir + "/9.9.9"
+try? FileManager.default.createDirectory(atPath: verDir, withIntermediateDirectories: true)
+try? FileManager.default.createSymbolicLink(atPath: verBin, withDestinationPath: "/bin/sleep")
+let versioned = Process()
+versioned.launchPath = verBin
+versioned.arguments = ["30"]
+try? versioned.run()
+print("versioned pid \(versioned.processIdentifier): ps-comm=[\(psComm(versioned.processIdentifier))]")
+check("versioned-binary session accepted by new impl", newImpl(versioned.processIdentifier) == true)
+versioned.terminate()
+try? FileManager.default.removeItem(atPath: NSTemporaryDirectory() + "repro-pid-reuse-\(getpid())")
 
 print(fail ? "RESULT: FAIL" : "RESULT: PASS")
 exit(fail ? 1 : 0)
