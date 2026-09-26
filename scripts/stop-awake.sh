@@ -12,6 +12,7 @@ SESSIONS_DIR="$STATE_DIR/sessions"
 PAUSED_DIR="$STATE_DIR/paused"
 BG_DIR="$STATE_DIR/bg"
 TRANSCRIPTS_DIR="$STATE_DIR/transcripts"
+LIMIT_DIR="$STATE_DIR/limit"
 DAEMON_PID_FILE="$STATE_DIR/daemon.pid"
 LOCK_DIR="$STATE_DIR/.lock"
 
@@ -78,6 +79,7 @@ fi
 rm -f "$SESSIONS_DIR/$PARENT_PID"
 rm -f "$PAUSED_DIR/$PARENT_PID"
 rm -f "$TRANSCRIPTS_DIR/$PARENT_PID"
+rm -f "$LIMIT_DIR/$PARENT_PID"
 
 if ! has_live_sessions; then
   if [ -f "$DAEMON_PID_FILE" ]; then

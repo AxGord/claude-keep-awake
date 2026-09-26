@@ -2,6 +2,8 @@
 // - IOPMAssertion: prevents idle sleep (display + system)
 // - IOKit selector 12 (kPMSetClamshellSleepState): prevents lid-close sleep
 // - Polls AppleClamshellState (1 Hz), plays sounds on lid open/close
+// - Holds across a usage-limit stop until the reset (when the CLI's auto-continue is on)
+//   and re-prompts the session through its messaging socket if the CLI did not
 // - Cleans up on SIGTERM/SIGINT/SIGHUP/exit
 //
 // Apple Silicon + macOS Sequoia tested. No root, no entitlements.
@@ -36,6 +38,22 @@ let TRANSCRIPTS_DIR = "\(STATE_DIR)/transcripts"
 // use]" (Esc while a tool runs). Matching the prefix catches both.
 let INTERRUPT_MARKER = "[Request interrupted by user"
 let TRANSCRIPT_TAIL_BYTES = 65536  // only the tail is scanned; the marker is the last line
+// limit-awake.sh writes limit/<PID> when a turn ended on a usage-limit stop
+// (StopFailure, error=rate_limit) and the CLI's own autoContinueAtUsageLimit is
+// on. Lines: reset epoch, messaging socket path, messaging token, optional
+// "injected". While the marker is pending the session counts as active — over the
+// paused marker, the API-error transcript rule and the hook-idle watchdog — so
+// the CLI's built-in auto-continue can fire at reset. Any hook firing removes the
+// marker (keep-awake.sh); if it is still there at reset+grace the CLI did not
+// resume, and the daemon sends the continue prompt itself through the session's
+// messaging socket (the channel SendMessage uses between sessions; undocumented,
+// peer protocol 1 — any failure just releases the Mac as before).
+let LIMIT_DIR = "\(STATE_DIR)/limit"
+let LIMIT_RESUME_GRACE_SEC: TimeInterval =
+    max(0, Double(ProcessInfo.processInfo.environment["KEEP_AWAKE_LIMIT_GRACE_SEC"] ?? "") ?? 90)
+let LIMIT_INJECT_REPLY_WAIT_MS: Int32 = 2000
+let LIMIT_MAX_HOLD_SEC: TimeInterval = 6 * 3600  // a 5h window plus slack; longer = weekly limit or a misparse
+let LIMIT_CONTINUE_PROMPT = "Usage limit has reset. Continue the task that was interrupted by the limit stop. If nothing was in progress, reply with one line saying so."
 // A session PID is honored only while it remains a process of this name. Guards
 // against PID reuse: a recycled PID passes kill(0) but is no longer claude.
 // Overridable (KEEP_AWAKE_PROC_NAME) for tests and non-native installs.
@@ -245,6 +263,159 @@ func sessionTurnAborted(_ name: String) -> Bool {
     return false
 }
 
+// ---------- usage-limit hold ----------
+struct LimitMarker {
+    let epoch: Date
+    let socket: String
+    let token: String
+    let injected: Bool
+}
+
+// Sessions whose hold was already logged; cleared when the marker goes away.
+var announcedLimitHolds = Set<String>()
+
+// nil if absent or malformed; validity (pid, cap, expiry) is the caller's call.
+func readLimitMarker(_ name: String) -> LimitMarker? {
+    guard let raw = try? String(contentsOfFile: "\(LIMIT_DIR)/\(name)", encoding: .utf8) else {
+        announcedLimitHolds.remove(name)  // gone (hook removed it) → a later hold logs again
+        return nil
+    }
+    let lines = raw.components(separatedBy: "\n")
+    guard lines.count >= 3, let secs = TimeInterval(lines[0].trimmingCharacters(in: .whitespaces)) else { return nil }
+    return LimitMarker(epoch: Date(timeIntervalSince1970: secs), socket: lines[1], token: lines[2],
+                       injected: lines.dropFirst(3).contains("injected"))
+}
+
+func writeLimitMarker(_ name: String, _ m: LimitMarker) -> Bool {
+    let text = "\(Int(m.epoch.timeIntervalSince1970))\n\(m.socket)\n\(m.token)\n" + (m.injected ? "injected\n" : "")
+    return (try? text.write(toFile: "\(LIMIT_DIR)/\(name)", atomically: true, encoding: .utf8)) != nil
+}
+
+func dropLimitMarker(_ name: String) {
+    try? FileManager.default.removeItem(atPath: "\(LIMIT_DIR)/\(name)")
+    announcedLimitHolds.remove(name)
+}
+
+// A hold is pending while the marker is well-formed, within the cap and before
+// reset+grace. Read-only apart from the one-time log; processLimitMarkers()
+// owns dropping and injecting.
+func pendingLimitMarker(_ name: String) -> LimitMarker? {
+    guard let m = readLimitMarker(name),
+          m.epoch.timeIntervalSinceNow <= LIMIT_MAX_HOLD_SEC,
+          Date() < m.epoch.addingTimeInterval(LIMIT_RESUME_GRACE_SEC)
+    else { return nil }
+    if !announcedLimitHolds.contains(name) {
+        announcedLimitHolds.insert(name)
+        let fmt = DateFormatter(); fmt.dateFormat = "HH:mm"
+        log("limit stop: holding session \(name) until \(fmt.string(from: m.epoch))")
+    }
+    return m
+}
+
+func jsonEscaped(_ s: String) -> String {
+    s.replacingOccurrences(of: "\\", with: "\\\\").replacingOccurrences(of: "\"", with: "\\\"")
+}
+
+// Two newline-terminated JSON lines — the auth frame, then a user message — over
+// the session's messaging socket. Blocks the main queue for at most the reply
+// wait (the CLI reads the lines before the peer goes away), once per reset.
+// Success means the bytes were accepted, not that the CLI honoured them — the
+// transcript rule settles that afterwards. Returns nil on success, else a reason.
+func injectContinue(_ m: LimitMarker) -> String? {
+    var addr = sockaddr_un()
+    addr.sun_family = sa_family_t(AF_UNIX)
+    let cap = MemoryLayout.size(ofValue: addr.sun_path)
+    guard m.socket.utf8.count < cap else { return "socket path too long" }
+    withUnsafeMutablePointer(to: &addr.sun_path) {
+        $0.withMemoryRebound(to: CChar.self, capacity: cap) { _ = strlcpy($0, m.socket, cap) }
+    }
+    let fd = socket(AF_UNIX, SOCK_STREAM, 0)
+    guard fd >= 0 else { return "socket: \(String(cString: strerror(errno)))" }
+    defer { close(fd) }
+    let rc = withUnsafePointer(to: &addr) {
+        $0.withMemoryRebound(to: sockaddr.self, capacity: 1) { connect(fd, $0, socklen_t(MemoryLayout<sockaddr_un>.size)) }
+    }
+    guard rc == 0 else { return "connect: \(String(cString: strerror(errno)))" }
+    let payload = "{\"type\":\"auth\",\"token\":\"\(jsonEscaped(m.token))\"}\n"
+        + "{\"type\":\"user\",\"message\":{\"role\":\"user\",\"content\":\"\(jsonEscaped(LIMIT_CONTINUE_PROMPT))\"}}\n"
+    let bytes = Array(payload.utf8)
+    var sent = 0
+    let written: Bool = bytes.withUnsafeBytes { buf in
+        while sent < buf.count {
+            let n = write(fd, buf.baseAddress! + sent, buf.count - sent)
+            if n <= 0 { return false }
+            sent += Int(n)
+        }
+        return true
+    }
+    guard written else { return "write: \(String(cString: strerror(errno)))" }
+    shutdown(fd, SHUT_WR)
+    var pfd = pollfd(fd: fd, events: Int16(POLLIN), revents: 0)
+    _ = poll(&pfd, 1, LIMIT_INJECT_REPLY_WAIT_MS)
+    return nil
+}
+
+// 1 Hz. A marker is over early when the session moved on without any hook: a
+// local command (/rate-limit-options "Don't continue", /low-priority), a typed
+// prompt or the CLI's own auto-continue all land as a newer user/assistant
+// message, so the transcript no longer ends in the API error. Otherwise it is
+// settled once reset+grace has passed: the CLI resumed on its own (a hook
+// touched sessions/<PID> after the reset — keep-awake.sh normally removes the
+// marker outright), or it did not and the continue prompt is injected. The injection is this session's next user prompt, so the paused
+// marker goes the way keep-awake.sh clears it on UserPromptSubmit; the marker is
+// then rewritten as "injected" with epoch=now so the hold bridges the seconds
+// until the CLI appends the prompt to the transcript. After that the ordinary
+// rules decide: a transcript no longer ending in the API error is a live turn,
+// one still ending in it means the CLI ignored us and the Mac is released.
+func processLimitMarkers() {
+    let files = (try? FileManager.default.contentsOfDirectory(atPath: LIMIT_DIR)) ?? []
+    for f in files {
+        guard let pid = Int32(f), kill(pid, 0) == 0,
+              let m = readLimitMarker(f), m.epoch.timeIntervalSinceNow <= LIMIT_MAX_HOLD_SEC
+        else {
+            log("limit marker for session \(f) invalid/expired → dropped")
+            dropLimitMarker(f); continue
+        }
+        // Judged only once the marker has aged past the grace: at the stop itself
+        // the error line and the StopFailure hook race by milliseconds.
+        let written = (try? FileManager.default.attributesOfItem(atPath: "\(LIMIT_DIR)/\(f)"))?[.modificationDate] as? Date ?? Date()
+        if !m.injected, Date().timeIntervalSince(written) > LIMIT_RESUME_GRACE_SEC, !sessionTurnAborted(f) {
+            log("limit reset: session \(f) moved on (transcript) → no inject")
+            dropLimitMarker(f); continue
+        }
+        if Date() < m.epoch.addingTimeInterval(LIMIT_RESUME_GRACE_SEC) { continue }
+        // Process identity only at settle time: pidIsClaude forks ps, and a
+        // transient spawn failure must not cost a pending hold.
+        guard pidIsClaude(pid) else {
+            log("limit marker for session \(f) invalid/expired → dropped")
+            dropLimitMarker(f); continue
+        }
+        if m.injected {
+            log("limit reset: injected hold for session \(f) over → transcript decides")
+            dropLimitMarker(f); continue
+        }
+        let touched = (try? FileManager.default.attributesOfItem(atPath: "\(SESSIONS_DIR)/\(f)"))?[.modificationDate] as? Date
+        if let t = touched, t > m.epoch {
+            log("limit reset: session \(f) resumed on its own → no inject")
+            dropLimitMarker(f); continue
+        }
+        if m.socket.isEmpty || m.token.isEmpty {
+            log("limit reset: inject into session \(f) failed (no messaging socket) → releasing")
+            dropLimitMarker(f); continue
+        }
+        if let err = injectContinue(m) {
+            log("limit reset: inject into session \(f) failed (\(err)) → releasing")
+            dropLimitMarker(f); continue
+        }
+        log("limit reset: injected continue into session \(f)")
+        try? FileManager.default.removeItem(atPath: "\(PAUSED_DIR)/\(f)")
+        if !writeLimitMarker(f, LimitMarker(epoch: Date(), socket: m.socket, token: m.token, injected: true)) {
+            log("limit reset: could not rewrite marker for session \(f) → releasing")
+            dropLimitMarker(f)
+        }
+    }
+}
+
 // ---------- per-session pause ----------
 // A session is active iff its PID is alive AND it has no paused/<PID> marker.
 // Session filename == PID string (keep-awake.sh); marker filename matches.
@@ -255,6 +426,7 @@ func hasActiveSession() -> Bool {
               let pid = Int32(content.trimmingCharacters(in: .whitespacesAndNewlines))
         else { continue }
         if kill(pid, 0) != 0 || !pidIsClaude(pid) { continue }                      // dead or PID reused
+        if pendingLimitMarker(f) != nil { return true }                              // limit stop: hold for the reset
         if FileManager.default.fileExists(atPath: "\(PAUSED_DIR)/\(f)") { continue } // paused
         if sessionTurnAborted(f) { continue }                                        // turn aborted (Esc / API error)
         return true
@@ -585,6 +757,7 @@ pollTimer.setEventHandler {
         }
     }
     lastLidClosed = cur
+    processLimitMarkers()
     updateHold()
 }
 pollTimer.resume()
@@ -633,7 +806,9 @@ monitorTimer.setEventHandler {
         else { continue }
         if newestTouch == nil || m > newestTouch! { newestTouch = m }
     }
-    if let n = newestTouch, Date().timeIntervalSince(n) > HOOK_IDLE_LIMIT {
+    // A pending usage-limit hold is legitimate hook silence (bounded by LIMIT_MAX_HOLD_SEC).
+    let limitPending = files.contains { pendingLimitMarker($0) != nil }
+    if let n = newestTouch, !limitPending, Date().timeIntervalSince(n) > HOOK_IDLE_LIMIT {
         log("no hook activity for >\(Int(HOOK_IDLE_LIMIT))s (CLI hung) → self-exit")
         cleanup(); exit(0)
     }
@@ -644,7 +819,10 @@ monitorTimer.setEventHandler {
               let pid = Int32(content.trimmingCharacters(in: .whitespacesAndNewlines))
         else { continue }
         if kill(pid, 0) == 0 && pidIsClaude(pid) { anyAlive = true }
-        else { try? FileManager.default.removeItem(atPath: "\(PAUSED_DIR)/\(f)") }  // dead/reused → reap marker
+        else {  // dead/reused → reap markers
+            try? FileManager.default.removeItem(atPath: "\(PAUSED_DIR)/\(f)")
+            dropLimitMarker(f)
+        }
     }
     if anyAlive { return }
     log("all registered sessions dead → self-exit")
