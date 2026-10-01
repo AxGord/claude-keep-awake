@@ -9,6 +9,7 @@ set -u
 # stable for its whole lifetime. UUID keying leaked one file per session_id
 # that Stop never reaped, holding the daemon awake indefinitely.
 # Single read captures full JSON (NUL delimiter → reads to EOF). 1s cap.
+HOOK_INPUT=""  # stays set under `set -u` even if the read times out
 IFS= read -r -t 1 -d '' HOOK_INPUT || true
 PARENT_PID="${PPID:-$$}"
 
@@ -32,6 +33,7 @@ fi
 SESSIONS_DIR="$STATE_DIR/sessions"
 PAUSED_DIR="$STATE_DIR/paused"
 BG_DIR="$STATE_DIR/bg"
+BGOUT_DIR="$STATE_DIR/bgout"
 TRANSCRIPTS_DIR="$STATE_DIR/transcripts"
 LIMIT_DIR="$STATE_DIR/limit"
 DAEMON_PID_FILE="$STATE_DIR/daemon.pid"
@@ -83,6 +85,7 @@ reap_dead_sessions() {
       rm -f "$f"
       rm -f "$PAUSED_DIR/${pid:-$(basename "$f")}"
       rm -f "$BG_DIR/${pid:-$(basename "$f")}"
+      rm -f "$BGOUT_DIR/${pid:-$(basename "$f")}"
       rm -f "$TRANSCRIPTS_DIR/${pid:-$(basename "$f")}"
       rm -f "$LIMIT_DIR/${pid:-$(basename "$f")}"
     fi
@@ -166,24 +169,29 @@ if [ -n "$tpath" ]; then
   printf '%s\n' "$tpath" > "$TRANSCRIPTS_DIR/$PARENT_PID"
 fi
 
-# Background-task tracking. A tool launched with run_in_background outlives the
-# turn: Claude ends the turn (Stop fires) while the task still runs, then is
-# revived by its completion. Without this, stop-awake.sh would unregister the
-# session — releasing the Mac mid-task. The revival fires no reliable hook (task
-# completion is injected as a notification, not a UserPromptSubmit), so a marker
-# cleared only on the next prompt leaked: a user who walked away after launching
-# a task pinned the Mac awake until the 2h watchdog. Instead, tie the marker to
-# the task itself. PostToolUse fires at launch and its tool_response carries the
-# task's output file; Claude holds that file open for the task's whole lifetime,
-# so stop-awake.sh can probe liveness with lsof. Record one output path per line.
-if [[ $HOOK_INPUT == *'"hook_event_name":"PostToolUse"'* \
-   && $HOOK_INPUT == *'"run_in_background":true'* ]]; then
-  # Anchor on Claude's literal "written to: <path>" so a /tasks/*.output path
-  # appearing in the command text itself can't be mistaken for the task's file.
-  task_out=$(printf '%s' "$HOOK_INPUT" | sed -nE 's/.*written to: (\/[^"[:space:]]+\.output).*/\1/p' | head -1)
-  if [ -n "$task_out" ]; then
-    mkdir -p "$BG_DIR"
-    printf '%s\n' "$task_out" >> "$BG_DIR/$PARENT_PID"
+# Background shell tasks. stop-awake.sh decides which background work holds the
+# Mac from the Stop payload's background_tasks, where a Monitor (a watcher) is
+# listed as a shell task like any build — so record Monitor ids at launch as
+# `monitor:<id>` to keep them from ever holding. PostToolUse's tool_response is
+# the tool's data: Monitor → {"taskId":…}; background Bash →
+# {…,"backgroundTaskId":…} with no output path (stop-awake.sh finds
+# <id>.output under Claude's tmp dir). Older CLIs put "…written to: <path>" in
+# tool_response — record that path so their fallback can probe it with lsof.
+if [[ $HOOK_INPUT == *'"hook_event_name":"PostToolUse"'* ]]; then
+  if [[ $HOOK_INPUT == *'"tool_name":"Monitor"'* ]]; then
+    mon_id=$(printf '%s' "$HOOK_INPUT" | sed -nE 's/.*"taskId":"([^"]+)".*/\1/p' | head -1)
+    if [ -n "$mon_id" ]; then
+      mkdir -p "$BGOUT_DIR"
+      printf 'monitor:%s\n' "$mon_id" >> "$BGOUT_DIR/$PARENT_PID"
+    fi
+  elif [[ $HOOK_INPUT == *'"run_in_background":true'* ]]; then
+    # Anchor on Claude's literal "written to: <path>" so a /tasks/*.output path
+    # appearing in the command text itself can't be mistaken for the task's file.
+    task_out=$(printf '%s' "$HOOK_INPUT" | sed -nE 's/.*written to: (\/[^"[:space:]]+\.output).*/\1/p' | head -1)
+    if [ -n "$task_out" ]; then
+      mkdir -p "$BGOUT_DIR"
+      printf '%s\n' "$task_out" >> "$BGOUT_DIR/$PARENT_PID"
+    fi
   fi
 fi
 
