@@ -54,6 +54,25 @@ let LIMIT_RESUME_GRACE_SEC: TimeInterval =
 let LIMIT_INJECT_REPLY_WAIT_MS: Int32 = 2000
 let LIMIT_MAX_HOLD_SEC: TimeInterval = 6 * 3600  // a 5h window plus slack; longer = weekly limit or a misparse
 let LIMIT_CONTINUE_PROMPT = "Usage limit has reset. Continue the task that was interrupted by the limit stop. If nothing was in progress, reply with one line saying so."
+// stop-awake.sh writes bg/<PID> when the turn ended with background work still
+// running (async subagents, workflows, run_in_background shell tasks). Lines:
+// first_seen epoch<TAB>type<TAB>id<TAB>path (shell: output file, subagent:
+// transcript). While any entry holds, the session counts as active — over the
+// paused marker (the 60s idle_prompt Notification fires regardless of running
+// tasks) and the aborted-turn rule — since the work runs whether or not Claude
+// waits for the user.
+let BG_DIR = "\(STATE_DIR)/bg"
+let BGOUT_DIR = "\(STATE_DIR)/bgout"
+let BG_SHELL_MAX_HOLD_SEC: TimeInterval = 3600  // a longer-running process is suspect; mirrors stop-awake.sh
+// A live subagent appends to its transcript at least every tool call (the Bash
+// tool caps a foreground command at 10 min); this long silent = it is gone.
+let BG_SUBAGENT_SILENT_SEC: TimeInterval = 1800
+let BG_RECHECK_SEC: TimeInterval = 15    // shell entries cost two lsof runs; updateHold ticks at 1 Hz
+let BG_SERVER_CONFIRM_SEC: TimeInterval = 30  // listening this long before a shell task counts as a server
+// A subagent's final text line may carry stop_reason null (a streaming
+// snapshot); mid-message such a line is followed by its tool_use within ms.
+let BG_SUBAGENT_QUIET_SEC: TimeInterval = 90
+let PROBE_TIMEOUT_SEC: TimeInterval = 3  // lsof can hang on a stale network mount
 // A session PID is honored only while it remains a process of this name. Guards
 // against PID reuse: a recycled PID passes kill(0) but is no longer claude.
 // Overridable (KEEP_AWAKE_PROC_NAME) for tests and non-native installs.
@@ -195,18 +214,11 @@ func isNetworkAvailable() -> Bool {
 // equals SESSION_PROC_NAME, so the daemon self-exited while real sessions ran.
 // A backgrounded session runs straight from the installer's versioned binary
 // (…/claude/versions/<ver>) rather than via the `claude` symlink — same CLI.
+// An unanswered ps (spawn failure, timeout) counts as claude: kill(0) already
+// saw the PID alive, and a false "not claude" reaps a live session's markers.
 func pidIsClaude(_ pid: pid_t) -> Bool {
-    let task = Process()
-    task.launchPath = "/bin/ps"
-    task.arguments = ["-p", "\(pid)", "-o", "comm="]
-    let pipe = Pipe()
-    task.standardOutput = pipe
-    task.standardError = FileHandle.nullDevice
-    do { try task.run() } catch { return false }
-    let data = pipe.fileHandleForReading.readDataToEndOfFile()
-    task.waitUntilExit()
-    let comm = String(data: data, encoding: .utf8)?
-        .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+    guard let out = runCapture("/bin/ps", ["-p", "\(pid)", "-o", "comm="]) else { return true }
+    let comm = out.trimmingCharacters(in: .whitespacesAndNewlines)
     return comm == SESSION_PROC_NAME || comm.hasSuffix("/\(SESSION_PROC_NAME)")
         || comm.contains("/\(SESSION_PROC_NAME)/versions/")
 }
@@ -236,18 +248,13 @@ func messageIsInterrupt(_ msg: [String: Any]) -> Bool {
     return false
 }
 
-// True iff the session's transcript ends with an aborted turn: the last
-// user/assistant message is an Esc-interrupt marker or an API-error stop.
-// Reads only the tail; metadata/partial lines are skipped, so the first
-// complete message scanned from the end decides.
-func sessionTurnAborted(_ name: String) -> Bool {
-    guard let raw = try? String(contentsOfFile: "\(TRANSCRIPTS_DIR)/\(name)", encoding: .utf8)
-    else { return false }
-    let path = raw.trimmingCharacters(in: .whitespacesAndNewlines)
-    guard !path.isEmpty,
-          let size = (try? FileManager.default.attributesOfItem(atPath: path))?[.size] as? Int,
+// The transcript's last complete user/assistant line (parsed), or nil. Reads only
+// the tail; metadata/partial lines are skipped, so the first complete message
+// scanned from the end decides.
+func lastTranscriptMessage(_ path: String) -> [String: Any]? {
+    guard let size = (try? FileManager.default.attributesOfItem(atPath: path))?[.size] as? Int,
           let fh = FileHandle(forReadingAtPath: path)
-    else { return false }
+    else { return nil }
     defer { try? fh.close() }
     if size > TRANSCRIPT_TAIL_BYTES { fh.seek(toFileOffset: UInt64(size - TRANSCRIPT_TAIL_BYTES)) }
     // Lossy decode: the tail may start mid-codepoint, which would make a strict
@@ -258,12 +265,24 @@ func sessionTurnAborted(_ name: String) -> Bool {
         guard let ld = String(line).data(using: .utf8),
               let obj = try? JSONSerialization.jsonObject(with: ld) as? [String: Any],
               let type = obj["type"] as? String, type == "user" || type == "assistant",
-              let msg = obj["message"] as? [String: Any]
+              obj["message"] is [String: Any]
         else { continue }                                    // metadata / partial line → skip
-        if obj["isApiErrorMessage"] as? Bool == true { return true } // limit/API-error stop
-        return messageIsInterrupt(msg)                       // last real message decides
+        return obj
     }
-    return false
+    return nil
+}
+
+// True iff the session's transcript ends with an aborted turn: the last
+// user/assistant message is an Esc-interrupt marker or an API-error stop.
+func sessionTurnAborted(_ name: String) -> Bool {
+    guard let raw = try? String(contentsOfFile: "\(TRANSCRIPTS_DIR)/\(name)", encoding: .utf8)
+    else { return false }
+    let path = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+    guard !path.isEmpty, let obj = lastTranscriptMessage(path),
+          let msg = obj["message"] as? [String: Any]
+    else { return false }
+    if obj["isApiErrorMessage"] as? Bool == true { return true } // limit/API-error stop
+    return messageIsInterrupt(msg)                               // last real message decides
 }
 
 // ---------- usage-limit hold ----------
@@ -419,8 +438,155 @@ func processLimitMarkers() {
     }
 }
 
+// ---------- background work ----------
+// stdout of a short-lived tool, or nil on spawn failure or PROBE_TIMEOUT_SEC.
+func runCapture(_ path: String, _ args: [String]) -> String? {
+    let task = Process()
+    task.launchPath = path
+    task.arguments = args
+    let pipe = Pipe()
+    task.standardOutput = pipe
+    task.standardError = FileHandle.nullDevice
+    let exited = DispatchSemaphore(value: 0)
+    task.terminationHandler = { _ in exited.signal() }
+    do { try task.run() } catch {
+        log("spawn \(path) failed: \(error)")
+        return nil
+    }
+    // Drain concurrently so a large output can't block the child on a full pipe.
+    var data = Data()
+    let drained = DispatchSemaphore(value: 0)
+    DispatchQueue.global().async {
+        data = pipe.fileHandleForReading.readDataToEndOfFile()
+        drained.signal()
+    }
+    if exited.wait(timeout: .now() + PROBE_TIMEOUT_SEC) == .timedOut {
+        kill(task.processIdentifier, SIGKILL)
+        log("\(path) timed out after \(Int(PROBE_TIMEOUT_SEC))s → killed")
+        return nil
+    }
+    // Reading `data` before the drain finished would race the closure.
+    guard drained.wait(timeout: .now() + 1) == .success else { return nil }
+    return String(data: data, encoding: .utf8) ?? ""
+}
+
+enum ShellTaskState { case done, listening, running, unknown }
+
+// A shell task's own processes (its shell and every child that inherited
+// stdout) hold its output file open while it runs — so the holders are the
+// task's process tree. None left → it finished (its revival Stop may lag). A
+// holder listening on TCP → likely a server whose command stop-awake.sh didn't
+// recognize. lsof failing or hanging (stale network mount) → unknown.
+func shellTaskState(_ outPath: String) -> ShellTaskState {
+    guard let holders = runCapture("/usr/sbin/lsof", ["-t", "--", outPath]) else { return .unknown }
+    let pids = holders.split(separator: "\n").map(String.init)
+    if pids.isEmpty { return .done }
+    guard let listening = runCapture("/usr/sbin/lsof",
+        ["-nP", "-a", "-p", pids.joined(separator: ","), "-iTCP", "-sTCP:LISTEN", "-t"])
+    else { return .unknown }
+    return listening.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? .running : .listening
+}
+
+// A subagent is done once its transcript ends with its final assistant message
+// (text, no tool_use: stop_reason end_turn, or null once quiet
+// BG_SUBAGENT_QUIET_SEC), an API error or an interrupt, or has gone silent
+// BG_SUBAGENT_SILENT_SEC. Without a transcript (no path in the Stop payload, a
+// session since /clear'd, not written yet) it holds only within the silence
+// window from first_seen.
+func subagentRunning(_ path: String, firstSeen: Double, now: Date) -> Bool {
+    guard !path.isEmpty,
+          let mtime = (try? FileManager.default.attributesOfItem(atPath: path))?[.modificationDate] as? Date
+    else { return now.timeIntervalSince1970 - firstSeen < BG_SUBAGENT_SILENT_SEC }
+    let quiet = now.timeIntervalSince(mtime)
+    if quiet >= BG_SUBAGENT_SILENT_SEC { return false }
+    guard let obj = lastTranscriptMessage(path), let msg = obj["message"] as? [String: Any]
+    else { return true }
+    if obj["isApiErrorMessage"] as? Bool == true { return false }
+    if obj["type"] as? String == "user" { return !messageIsInterrupt(msg) }
+    let parts = msg["content"] as? [[String: Any]] ?? []
+    let kinds = Set(parts.compactMap { $0["type"] as? String })
+    if kinds.contains("tool_use") || !kinds.contains("text") { return true }  // tool call / thinking only
+    if let stop = msg["stop_reason"] as? String { return stop == "tool_use" }
+    return quiet < BG_SUBAGENT_QUIET_SEC
+}
+
+var bgHoldCache: [String: (at: Date, mtime: Date, holds: Bool)] = [:]
+// Per "<session>/<task id>": when a shell task was first seen listening (a test
+// binding a port in-process listens briefly; a server keeps listening), and the
+// tasks settled for good — confirmed servers, and ones whose probe hung — so
+// they cost no more lsof runs.
+var bgListenSince: [String: Date] = [:]
+var bgServers: Set<String> = []
+var bgProbeStuck: Set<String> = []
+
+func forgetBgWork(_ name: String) {
+    let prefix = "\(name)/"
+    bgHoldCache.removeValue(forKey: name)
+    bgListenSince = bgListenSince.filter { !$0.key.hasPrefix(prefix) }
+    bgServers = bgServers.filter { !$0.hasPrefix(prefix) }
+    bgProbeStuck = bgProbeStuck.filter { !$0.hasPrefix(prefix) }
+}
+
+// True iff the session's bg marker names background work that should keep the
+// Mac awake: a live subagent, a workflow/teammate, or a shell task within
+// BG_SHELL_MAX_HOLD_SEC that is still running and not a server.
+func bgWorkHolds(_ name: String) -> Bool {
+    let path = "\(BG_DIR)/\(name)"
+    guard let mtime = (try? FileManager.default.attributesOfItem(atPath: path))?[.modificationDate] as? Date,
+          let raw = try? String(contentsOfFile: path, encoding: .utf8)
+    else {
+        forgetBgWork(name)
+        return false
+    }
+    let now = Date()
+    if let c = bgHoldCache[name], c.mtime == mtime, now.timeIntervalSince(c.at) < BG_RECHECK_SEC {
+        return c.holds
+    }
+    var holding: [String] = []
+    for line in raw.split(separator: "\n") {
+        let cols = line.split(separator: "\t", omittingEmptySubsequences: false).map(String.init)
+        guard cols.count >= 3, let first = Double(cols[0]) else { continue }
+        let (type, id) = (cols[1], cols[2])
+        let taskPath = cols.count >= 4 ? cols[3] : ""
+        switch type {
+        case "shell":
+            if now.timeIntervalSince1970 - first >= BG_SHELL_MAX_HOLD_SEC { continue }
+            let key = "\(name)/\(id)"
+            if bgServers.contains(key) { continue }
+            if !taskPath.isEmpty && !bgProbeStuck.contains(key) {
+                switch shellTaskState(taskPath) {
+                case .done:
+                    bgListenSince.removeValue(forKey: key)
+                    continue
+                case .listening:
+                    let since = bgListenSince[key] ?? now
+                    bgListenSince[key] = since
+                    if now.timeIntervalSince(since) >= BG_SERVER_CONFIRM_SEC {
+                        bgServers.insert(key)
+                        continue
+                    }
+                case .running: bgListenSince.removeValue(forKey: key)
+                case .unknown: bgProbeStuck.insert(key)  // hold, bounded by the shell cap
+                }
+            }
+        case "subagent":
+            if !subagentRunning(taskPath, firstSeen: first, now: now) { continue }
+        default: break  // workflow / teammate: no liveness probe; next Stop re-decides
+        }
+        holding.append("\(type) \(id)")
+    }
+    let holds = !holding.isEmpty
+    if holds != (bgHoldCache[name]?.holds ?? false) {
+        log(holds ? "background work holds session \(name): \(holding.joined(separator: ", "))"
+                  : "background work of session \(name) no longer holds (done, server or over the cap)")
+    }
+    bgHoldCache[name] = (at: now, mtime: mtime, holds: holds)
+    return holds
+}
+
 // ---------- per-session pause ----------
-// A session is active iff its PID is alive AND it has no paused/<PID> marker.
+// A session is active iff its PID is alive AND (background work holds it OR it
+// has no paused/<PID> marker and its turn wasn't aborted).
 // Session filename == PID string (keep-awake.sh); marker filename matches.
 func hasActiveSession() -> Bool {
     let files = (try? FileManager.default.contentsOfDirectory(atPath: SESSIONS_DIR)) ?? []
@@ -430,6 +596,7 @@ func hasActiveSession() -> Bool {
         else { continue }
         if kill(pid, 0) != 0 || !pidIsClaude(pid) { continue }                      // dead or PID reused
         if pendingLimitMarker(f) != nil { return true }                              // limit stop: hold for the reset
+        if bgWorkHolds(f) { return true }                                            // background work still running
         if FileManager.default.fileExists(atPath: "\(PAUSED_DIR)/\(f)") { continue } // paused
         if sessionTurnAborted(f) { continue }                                        // turn aborted (Esc / API error)
         return true
@@ -824,6 +991,9 @@ monitorTimer.setEventHandler {
         if kill(pid, 0) == 0 && pidIsClaude(pid) { anyAlive = true }
         else {  // dead/reused → reap markers
             try? FileManager.default.removeItem(atPath: "\(PAUSED_DIR)/\(f)")
+            try? FileManager.default.removeItem(atPath: "\(BG_DIR)/\(f)")
+            try? FileManager.default.removeItem(atPath: "\(BGOUT_DIR)/\(f)")
+            forgetBgWork(f)
             dropLimitMarker(f)
         }
     }
