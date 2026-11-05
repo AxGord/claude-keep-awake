@@ -96,7 +96,13 @@ start_daemon() {
   # subshell and the Swift daemon both inherit it.
   export SESSIONS_DIR SESSION_PROC_NAME
   export -f session_pid_live
-  export KEEP_AWAKE_HOOK_IDLE_LIMIT="${KEEP_AWAKE_HOOK_IDLE_LIMIT:-7200}"
+  # Non-integer or 0 → default: a bad value must neither disable the idle rule
+  # (bash `-ge` errors out) nor release at once.
+  case "${KEEP_AWAKE_HOOK_IDLE_LIMIT:-}" in
+    ''|*[!0-9]*) KEEP_AWAKE_HOOK_IDLE_LIMIT=7200 ;;
+  esac
+  [ "$KEEP_AWAKE_HOOK_IDLE_LIMIT" -gt 0 ] || KEEP_AWAKE_HOOK_IDLE_LIMIT=7200
+  export KEEP_AWAKE_HOOK_IDLE_LIMIT
   watchdog='
     while :; do
       sleep 60
