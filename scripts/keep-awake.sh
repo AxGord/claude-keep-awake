@@ -11,7 +11,7 @@ set -u
 # Single read captures full JSON (NUL delimiter → reads to EOF). 1s cap.
 HOOK_INPUT=""  # stays set under `set -u` even if the read times out
 IFS= read -r -t 1 -d '' HOOK_INPUT || true
-PARENT_PID="${PPID:-$$}"
+. "$(dirname "$0")/session-pid.sh"  # sets PARENT_PID, session_pid_live
 
 PLUGIN_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 STATE_DIR="${HOME}/.claude/keep-awake-state"
@@ -60,23 +60,6 @@ daemon_alive() {
   [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null
 }
 
-# A session PID counts as live only if the process exists AND is still a
-# `claude` process. A bare kill -0 also passes when the OS recycles a dead
-# session's PID to an unrelated process (observed: AudioComponentRegistrar) —
-# that phantom would otherwise keep the daemon awake forever. Process name is
-# overridable (KEEP_AWAKE_PROC_NAME) for tests and non-native installs.
-# A backgrounded session runs straight from the installer's versioned binary
-# (…/claude/versions/<ver>) rather than via the `claude` symlink — same CLI.
-SESSION_PROC_NAME="${KEEP_AWAKE_PROC_NAME:-claude}"
-session_pid_live() {
-  local pid="$1"
-  [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null || return 1
-  case "$(ps -p "$pid" -o comm= 2>/dev/null)" in
-    */"$SESSION_PROC_NAME"|"$SESSION_PROC_NAME"|*/"$SESSION_PROC_NAME"/versions/*) return 0 ;;
-    *) return 1 ;;
-  esac
-}
-
 reap_dead_sessions() {
   for f in "$SESSIONS_DIR"/*; do
     [ -e "$f" ] || continue
@@ -102,6 +85,44 @@ start_daemon() {
       return 0
     fi
   fi
+  # Watchdog for the Linux/Windows sleep-inhibitor. Runs alongside the inhibitor
+  # and ends it on either of the conditions the macOS daemon also self-exits on:
+  #   1. no registered CLI PID is alive, or
+  #   2. no hook has touched a session file for KEEP_AWAKE_HOOK_IDLE_LIMIT
+  #      seconds (keep-awake.sh rewrites $SESSIONS_DIR/<pid> on every hook, so an
+  #      active session refreshes it; this also catches a hung CLI and PID reuse).
+  # The Stop hook is the clean teardown; the watchdog covers a CLI that exits
+  # without firing it (crash, kill -9, terminal/SSH close).
+  #
+  # KEEP_AWAKE_HOOK_IDLE_LIMIT is the single knob, shared with the macOS daemon
+  # (which reads the same env var). Default 7200s / 2h; export it so the watchdog
+  # subshell and the Swift daemon both inherit it.
+  export SESSIONS_DIR SESSION_PROC_NAME
+  export -f session_pid_live
+  # Non-integer or 0 → default: a bad value must neither disable the idle rule
+  # (bash `-ge` errors out) nor release at once.
+  case "${KEEP_AWAKE_HOOK_IDLE_LIMIT:-}" in
+    ''|*[!0-9]*) KEEP_AWAKE_HOOK_IDLE_LIMIT=7200 ;;
+  esac
+  [ "$KEEP_AWAKE_HOOK_IDLE_LIMIT" -gt 0 ] || KEEP_AWAKE_HOOK_IDLE_LIMIT=7200
+  export KEEP_AWAKE_HOOK_IDLE_LIMIT
+  watchdog='
+    while :; do
+      sleep 60
+      # Windows: the holder is a sibling; once Stop killed it, this loop is moot.
+      [ -n "${KEEP_AWAKE_HOLDER_PID:-}" ] && ! kill -0 "$KEEP_AWAKE_HOLDER_PID" 2>/dev/null && exit 0
+      alive=0 newest=0
+      for f in "$SESSIONS_DIR"/*; do
+        [ -e "$f" ] || continue
+        pid=$(cat "$f" 2>/dev/null) || continue
+        session_pid_live "$pid" && alive=1
+        m=$(stat -c %Y "$f" 2>/dev/null) || m=0
+        [ "$m" -gt "$newest" ] && newest="$m"
+      done
+      [ "$alive" = 0 ] && break
+      [ "$newest" -gt 0 ] && [ $(( $(date +%s) - newest )) -ge "${KEEP_AWAKE_HOOK_IDLE_LIMIT:-7200}" ] && break
+    done'
+
   case "$(uname -s)" in
     Darwin)
       local bin="$PLUGIN_DIR/bin/keep-awake-daemon"
@@ -126,10 +147,13 @@ start_daemon() {
       fi
       ;;
     Linux)
+      # The inhibitor wraps the watchdog: when the loop returns, bash exits and
+      # the inhibit is released. stop-awake.sh (kill / pkill -P the recorded PID)
+      # is the fast path on a clean Stop.
       if command -v systemd-inhibit >/dev/null 2>&1; then
-        nohup systemd-inhibit --what=sleep:idle --who=claude-keep-awake --why=working sleep 86400 </dev/null >/dev/null 2>&1 &
+        nohup systemd-inhibit --what=sleep:idle --who=claude-keep-awake --why=working bash -c "$watchdog" </dev/null >/dev/null 2>&1 &
       elif command -v gnome-session-inhibit >/dev/null 2>&1; then
-        nohup gnome-session-inhibit --inhibit suspend --reason "Claude Code working" sleep 86400 </dev/null >/dev/null 2>&1 &
+        nohup gnome-session-inhibit --inhibit suspend --reason "Claude Code working" bash -c "$watchdog" </dev/null >/dev/null 2>&1 &
       else
         return 0
       fi
@@ -137,12 +161,24 @@ start_daemon() {
       disown $! 2>/dev/null || true
       ;;
     MINGW*|MSYS*|CYGWIN*)
+      # SetThreadExecutionState is per-thread and cleared on process exit, so the
+      # PowerShell holder must stay alive to keep the assertion. A sibling bash
+      # watchdog (same session_pid_live check, which uses `ps -W` here) kills it
+      # when no session is alive or all went idle, and exits on its own once
+      # stop-awake.sh killed the holder. Start-Sleep is only a hard ceiling; an
+      # active session past it gets a fresh holder on its next hook.
+      # 2147483651 = 0x80000003 = ES_CONTINUOUS|ES_SYSTEM_REQUIRED|ES_DISPLAY_REQUIRED,
+      # written in decimal: PowerShell reads 0x80000000 as a negative Int32, so the
+      # old `[uint32](0x80000000 -bor …)` threw and the call never happened.
       nohup powershell.exe -NoProfile -WindowStyle Hidden -Command "
         Add-Type -MemberDefinition '[DllImport(\"kernel32.dll\")] public static extern uint SetThreadExecutionState(uint esFlags);' -Name W -Namespace K;
-        [K.W]::SetThreadExecutionState([uint32](0x80000000 -bor 0x00000001 -bor 0x00000002));
-        Start-Sleep -Seconds 86400
+        [K.W]::SetThreadExecutionState([uint32]2147483651);
+        Start-Sleep -Seconds 7200
       " </dev/null >/dev/null 2>&1 &
-      echo $! > "$DAEMON_PID_FILE"
+      dpid=$!
+      echo "$dpid" > "$DAEMON_PID_FILE"
+      disown "$dpid" 2>/dev/null || true
+      KEEP_AWAKE_HOLDER_PID="$dpid" nohup bash -c "$watchdog"'; kill '"$dpid"' 2>/dev/null' </dev/null >/dev/null 2>&1 &
       disown $! 2>/dev/null || true
       ;;
   esac

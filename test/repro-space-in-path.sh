@@ -7,6 +7,7 @@
 #   subst - ${CLAUDE_PLUGIN_ROOT} replaced textually before the shell sees it
 # against a fake plugin root whose scripts are stubs that record they ran.
 set -u
+unset CLAUDE_PID  # run from inside Claude Code: key hooks on this test, not the real CLI
 
 REPO="$(cd "$(dirname "$0")/.." && pwd)"
 HOOKS="$REPO/hooks/hooks.json"
