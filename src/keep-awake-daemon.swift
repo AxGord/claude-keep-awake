@@ -65,9 +65,11 @@ let EMPTY_GRACE_SEC: TimeInterval = 300  // exit after 5 min with no sessions
 // If the newest session file goes untouched this long, the CLI is alive but
 // hung (no hooks firing) — release the machine rather than hold it awake forever.
 // Overridable via env; keep-awake.sh exports KEEP_AWAKE_HOOK_IDLE_LIMIT (same
-// default) to the Linux/Windows watchdog, so this is one shared knob.
+// default) to the non-macOS watchdog, so this is one shared knob. A value that
+// isn't a positive finite number falls back to the default (0 would self-exit at once).
 let HOOK_IDLE_LIMIT: TimeInterval = ProcessInfo.processInfo.environment["KEEP_AWAKE_HOOK_IDLE_LIMIT"]
-    .flatMap { TimeInterval($0) } ?? 7200  // 2h
+    .flatMap { TimeInterval($0) }
+    .flatMap { $0 > 0 && $0.isFinite ? $0 : nil } ?? 7200  // 2h
 // AC plug-in on Apple Silicon causes a brief forced sleep (kernel bug, no userspace fix).
 // Mark the lid as unsafe-to-close for this window so a statusline can warn the user.
 let UNSAFE_LID_WINDOW_SEC: TimeInterval = 20
