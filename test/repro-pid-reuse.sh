@@ -5,6 +5,7 @@
 # phantom. Here KEEP_AWAKE_PROC_NAME=bash makes this test's own bash sessions
 # valid; a `sleep` process (comm=sleep) stands in for the recycled-PID phantom.
 set -u
+unset CLAUDE_PID  # run from inside Claude Code: key hooks on this test, not the real CLI
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 SCRIPTS="$ROOT/scripts"
 FAIL=0

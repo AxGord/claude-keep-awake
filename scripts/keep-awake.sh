@@ -82,8 +82,8 @@ start_daemon() {
       return 0
     fi
   fi
-  # Watchdog for the Linux sleep-inhibitor. Runs alongside the inhibitor and
-  # ends it on either of the conditions the macOS daemon also self-exits on:
+  # Watchdog for the Linux/Windows sleep-inhibitor. Runs alongside the inhibitor
+  # and ends it on either of the conditions the macOS daemon also self-exits on:
   #   1. no registered CLI PID is alive, or
   #   2. no hook has touched a session file for KEEP_AWAKE_HOOK_IDLE_LIMIT
   #      seconds (keep-awake.sh rewrites $SESSIONS_DIR/<pid> on every hook, so an
@@ -106,6 +106,8 @@ start_daemon() {
   watchdog='
     while :; do
       sleep 60
+      # Windows: the holder is a sibling; once Stop killed it, this loop is moot.
+      [ -n "${KEEP_AWAKE_HOLDER_PID:-}" ] && ! kill -0 "$KEEP_AWAKE_HOLDER_PID" 2>/dev/null && exit 0
       alive=0 newest=0
       for f in "$SESSIONS_DIR"/*; do
         [ -e "$f" ] || continue
@@ -156,12 +158,24 @@ start_daemon() {
       disown $! 2>/dev/null || true
       ;;
     MINGW*|MSYS*|CYGWIN*)
+      # SetThreadExecutionState is per-thread and cleared on process exit, so the
+      # PowerShell holder must stay alive to keep the assertion. A sibling bash
+      # watchdog (same session_pid_live check, which uses `ps -W` here) kills it
+      # when no session is alive or all went idle, and exits on its own once
+      # stop-awake.sh killed the holder. Start-Sleep is only a hard ceiling; an
+      # active session past it gets a fresh holder on its next hook.
+      # 2147483651 = 0x80000003 = ES_CONTINUOUS|ES_SYSTEM_REQUIRED|ES_DISPLAY_REQUIRED,
+      # written in decimal: PowerShell reads 0x80000000 as a negative Int32, so the
+      # old `[uint32](0x80000000 -bor …)` threw and the call never happened.
       nohup powershell.exe -NoProfile -WindowStyle Hidden -Command "
         Add-Type -MemberDefinition '[DllImport(\"kernel32.dll\")] public static extern uint SetThreadExecutionState(uint esFlags);' -Name W -Namespace K;
-        [K.W]::SetThreadExecutionState([uint32](0x80000000 -bor 0x00000001 -bor 0x00000002));
-        Start-Sleep -Seconds 86400
+        [K.W]::SetThreadExecutionState([uint32]2147483651);
+        Start-Sleep -Seconds 7200
       " </dev/null >/dev/null 2>&1 &
-      echo $! > "$DAEMON_PID_FILE"
+      dpid=$!
+      echo "$dpid" > "$DAEMON_PID_FILE"
+      disown "$dpid" 2>/dev/null || true
+      KEEP_AWAKE_HOLDER_PID="$dpid" nohup bash -c "$watchdog"'; kill '"$dpid"' 2>/dev/null' </dev/null >/dev/null 2>&1 &
       disown $! 2>/dev/null || true
       ;;
   esac

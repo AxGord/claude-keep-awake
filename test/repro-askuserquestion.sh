@@ -7,6 +7,7 @@
 # approach raced: pause-awake.sh's `: > marker` finished before
 # keep-awake.sh's `rm -f marker`, leaving the Mac awake.
 set -u
+unset CLAUDE_PID  # run from inside Claude Code: key hooks on this test, not the real CLI
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 SCRIPTS="$ROOT/scripts"
 FAIL=0

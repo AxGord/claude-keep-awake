@@ -9,6 +9,7 @@
 # Reset times are generated relative to now (+2h) so the hook's 6h cap never
 # trips regardless of when the test runs.
 set -u
+unset CLAUDE_PID  # run from inside Claude Code: key hooks on this test, not the real CLI
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 HOOK="$ROOT/scripts/limit-awake.sh"
 FAIL=0

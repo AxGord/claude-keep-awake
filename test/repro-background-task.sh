@@ -12,6 +12,7 @@
 # — the old marker, cleared only on UserPromptSubmit, leaked until the watchdog.
 # Here a held-open file stands in for Claude's still-running background task.
 set -u
+unset CLAUDE_PID  # run from inside Claude Code: key hooks on this test, not the real CLI
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 SCRIPTS="$ROOT/scripts"
 FAIL=0
