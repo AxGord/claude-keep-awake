@@ -17,6 +17,7 @@
 # Drives the real daemon binary against an isolated state dir and a synthetic
 # transcript, asserting hold/release decisions from its log.
 set -u
+unset CLAUDE_PID  # run from inside Claude Code: key hooks on this test, not the real CLI
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 BIN=$(mktemp)
