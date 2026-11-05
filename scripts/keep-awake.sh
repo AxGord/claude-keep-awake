@@ -10,7 +10,7 @@ set -u
 # that Stop never reaped, holding the daemon awake indefinitely.
 # Single read captures full JSON (NUL delimiter → reads to EOF). 1s cap.
 IFS= read -r -t 1 -d '' HOOK_INPUT || true
-PARENT_PID="${PPID:-$$}"
+. "$(dirname "$0")/session-pid.sh"  # sets PARENT_PID, session_pid_live
 
 PLUGIN_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 STATE_DIR="${HOME}/.claude/keep-awake-state"
@@ -56,23 +56,6 @@ daemon_alive() {
   [ -f "$DAEMON_PID_FILE" ] || return 1
   local pid; pid=$(cat "$DAEMON_PID_FILE" 2>/dev/null) || return 1
   [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null
-}
-
-# A session PID counts as live only if the process exists AND is still a
-# `claude` process. A bare kill -0 also passes when the OS recycles a dead
-# session's PID to an unrelated process (observed: AudioComponentRegistrar) —
-# that phantom would otherwise keep the daemon awake forever. Process name is
-# overridable (KEEP_AWAKE_PROC_NAME) for tests and non-native installs.
-# A backgrounded session runs straight from the installer's versioned binary
-# (…/claude/versions/<ver>) rather than via the `claude` symlink — same CLI.
-SESSION_PROC_NAME="${KEEP_AWAKE_PROC_NAME:-claude}"
-session_pid_live() {
-  local pid="$1"
-  [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null || return 1
-  case "$(ps -p "$pid" -o comm= 2>/dev/null)" in
-    */"$SESSION_PROC_NAME"|"$SESSION_PROC_NAME"|*/"$SESSION_PROC_NAME"/versions/*) return 0 ;;
-    *) return 1 ;;
-  esac
 }
 
 reap_dead_sessions() {
