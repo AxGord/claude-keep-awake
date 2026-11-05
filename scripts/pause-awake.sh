@@ -8,7 +8,7 @@ set -u
 
 # Keyed by Claude CLI PID, matching keep-awake.sh (session_id is unstable).
 read -t 1 -r _ || true  # drain hook stdin
-PARENT_PID="${PPID:-$$}"
+. "$(dirname "$0")/session-pid.sh"  # sets PARENT_PID, session_pid_live
 
 STATE_DIR="${HOME}/.claude/keep-awake-state"
 
