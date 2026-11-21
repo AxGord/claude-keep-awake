@@ -18,20 +18,18 @@ A [Claude Code](https://code.claude.com/docs/en/overview) plugin that prevents y
 
 ## Quick Start
 
-Install from the official [community marketplace](https://github.com/anthropics/claude-plugins-community):
-
-```bash
-claude plugin marketplace add anthropics/claude-plugins-community
-claude plugin install keep-awake@claude-community
-```
-
-(or inside Claude Code: `/plugin install keep-awake@claude-community`)
-
-Or straight from this repo:
+Install from this repo (always up to date):
 
 ```bash
 claude plugin marketplace add AxGord/claude-keep-awake
 claude plugin install keep-awake@claude-keep-awake
+```
+
+It is also listed in the [community marketplace](https://github.com/anthropics/claude-plugins-community), which pins a fixed commit and may serve an older version:
+
+```bash
+claude plugin marketplace add anthropics/claude-plugins-community
+claude plugin install keep-awake@claude-community
 ```
 
 ## How It Works
