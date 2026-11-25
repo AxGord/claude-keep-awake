@@ -12,6 +12,7 @@ A [Claude Code](https://code.claude.com/docs/en/overview) plugin that prevents y
 - **Holds across a usage-limit stop** — keeps the Mac awake until the reset so Claude Code's auto-continue can fire, and re-prompts the session if it doesn't
 - **Stays awake across background work** — async subagents, workflows and `run_in_background` builds/tests; servers and watchers never hold
 - **Releases when the internet is gone** — macOS daemon lets the Mac sleep after 30 s offline, resumes instantly on reconnect
+- **Releases on low battery** — on battery at ≤ 25 % (`KEEP_AWAKE_MIN_BATTERY`) or with Low Power Mode on, the Mac sleeps normally instead of draining to empty with the lid closed
 - **One shared daemon per machine** — sessions are reference-counted; self-monitoring covers crashes and hung CLIs
 - **macOS Apple Silicon: stays awake with the lid closed** — no `sudo`, no code-signing, with audible Bottle/Submarine lid feedback
 - Cross-platform: macOS, Linux (systemd / gnome-session), Windows (Git Bash + PowerShell)
@@ -36,7 +37,7 @@ claude plugin install keep-awake@claude-community
 
 Four hook scripts register each Claude CLI session (keyed by its PID) with one shared per-machine daemon: `keep-awake.sh` on prompt/tool hooks, `pause-awake.sh` when Claude waits for you, `stop-awake.sh` on `Stop`, and `limit-awake.sh` on usage-limit stops. The daemon holds the OS sleep prevention while any live session is working and releases it when all are idle, offline or gone. On macOS it is a Swift binary (`IOPMAssertion` plus an IOKit clamshell selector); on Linux `systemd-inhibit`; on Windows `SetThreadExecutionState`.
 
-Full details — hooks, pause/resume latency, background work, aborted turns, usage-limit stops, network loss, the daemon table, closed-lid internals, state files — in [docs/how-it-works.md](docs/how-it-works.md).
+Full details — hooks, pause/resume latency, background work, aborted turns, usage-limit stops, network loss, low battery, the daemon table, closed-lid internals, state files — in [docs/how-it-works.md](docs/how-it-works.md).
 
 **Kill-switch**: create `~/.claude/keep-awake-state/disabled` to make the hooks a no-op (Mac sleeps normally); delete it to resume. Takes effect on the next hook in any active session.
 

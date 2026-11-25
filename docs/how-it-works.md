@@ -19,6 +19,8 @@ Three coordinated pieces:
 
 **Network-loss release** (macOS Swift daemon only): the daemon registers an `NWPathMonitor` for the default route. When the route goes unsatisfied (Wi-Fi off, Ethernet unplugged, no usable interface) the daemon waits 30 s — to ride out brief flaps like Wi-Fi roam or captive-portal reauth — then releases assertions and re-enables clamshell sleep, exactly as if every session had paused. On the next satisfied path it re-acquires immediately. Holding sleep-prevention while Claude can't reach the API would just burn battery, so this trades a brief offline grace for letting the Mac sleep when it should.
 
+**Low-battery release** (macOS Swift daemon only): on battery, the daemon releases once the internal battery is at or below 25 %, or as soon as Low Power Mode is on — exactly as if every session had paused, so a closed lid then sleeps normally. Without it, a closed-lid session keeps the Mac at full clock until macOS forces an emergency hibernate at ~1 %. It re-acquires when AC is plugged in, or when Low Power Mode is switched off while the charge is still above the cutoff. On AC nothing changes, even with Low Power Mode set to *Always*. Set `KEEP_AWAKE_MIN_BATTERY` (integer percentage, e.g. in the `env` block of `~/.claude/settings.json`) to move the cutoff; `0` disables the percentage check and leaves only Low Power Mode.
+
 The daemon is platform-specific:
 
 | OS | Daemon | What it prevents |
@@ -49,7 +51,7 @@ When you close the lid **with keep-awake active**:
 - An audible **Bottle** chime confirms the keep-awake is active
 - On open, **Submarine** chime confirms normal operation resumed; brightness fades back to its saved value over ~500ms (minimum restore floor 0.05 if saved was lower)
 
-When you close the lid **while keep-awake is released** (no active session, or network has been offline >30 s), the daemon skips the chime and the brightness override — the Mac takes the normal sleep path and you won't hear anything.
+When you close the lid **while keep-awake is released** (no active session, network offline >30 s, or battery low), the daemon skips the chime and the brightness override — the Mac takes the normal sleep path and you won't hear anything. If the release happens *after* the lid closed, opening it restores the saved brightness without the chime.
 
 If `swiftc` is not available, the plugin falls back to plain `caffeinate -dis` — that still prevents idle sleep, but lid-close on Apple Silicon will throw the system into DarkWake (network limited, processes throttled).
 
