@@ -927,7 +927,11 @@ pollTimer.setEventHandler {
                 playSound(SOUND_OPEN)
                 restoreBuiltin()
             } else {
-                log("lid opened (released, skipping chime/restore)")
+                // Released while the lid was closed (network loss, low battery):
+                // the dim from lid-close is still in effect, so undo it quietly.
+                // restoreBuiltin is a no-op when nothing was dimmed.
+                log("lid opened (released, skipping chime)")
+                restoreBuiltin()
             }
         }
     }
