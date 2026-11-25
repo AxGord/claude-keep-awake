@@ -96,6 +96,14 @@ let UNSAFE_LID_WINDOW_SEC: TimeInterval = 20
 // once the route goes away. Wait this long before releasing — survives brief flaps
 // (Wi-Fi roam, captive-portal reauth) without thrashing assertions.
 let NETWORK_GRACE_SEC: TimeInterval = 30
+// On battery, stop holding the Mac awake once the charge falls to this percentage
+// or Low Power Mode is on: a closed-lid session would otherwise run the battery
+// down to the emergency hibernate at ~1%. Re-acquired on AC, or once Low Power
+// Mode is off again above the cutoff. Overridable via env; 0 disables the
+// percentage cutoff, a value that isn't an integer in 0...100 falls back to 25.
+let MIN_BATTERY_PCT: Int = ProcessInfo.processInfo.environment["KEEP_AWAKE_MIN_BATTERY"]
+    .flatMap { Int($0) }
+    .flatMap { (0...100).contains($0) ? $0 : nil } ?? 25
 
 // ---------- logging ----------
 let logFmt: ISO8601DateFormatter = {
@@ -610,19 +618,22 @@ func hasActiveSession() -> Bool {
 }
 
 // Hold sleep-prevention iff some session is working AND the route is up
-// (or within the offline grace). Releasing also drops the active sleep veto
-// (see kIOMessageCanSystemSleep_raw) so the OS may sleep.
+// (or within the offline grace) AND the battery allows it. Releasing also drops
+// the active sleep veto (see kIOMessageCanSystemSleep_raw) so the OS may sleep.
 func updateHold() {
     let activeSession = hasActiveSession()
     let netUp = isNetworkAvailable()
-    let want = activeSession && netUp
+    let batteryLow = batteryLowReason()
+    let want = activeSession && netUp && batteryLow == nil
     if want == assertionsHeld { return }
     assertionsHeld = want
     if want {
-        log("hold acquired (session active, network up) → re-acquiring")
+        log("hold acquired (session active, network up, power ok) → re-acquiring")
         reapplyPower()
     } else {
-        let reason = !activeSession ? "no active session (paused/interrupted)" : "network offline >\(Int(NETWORK_GRACE_SEC))s"
+        let reason = !activeSession ? "no active session (paused/interrupted)"
+            : !netUp ? "network offline >\(Int(NETWORK_GRACE_SEC))s"
+            : batteryLow ?? "battery low"
         log("\(reason) → releasing")
         releaseAssertions()
         setClamshellSleep(disable: false)
@@ -636,6 +647,35 @@ func isOnAC() -> Bool {
     guard let info = IOPSCopyPowerSourcesInfo()?.takeRetainedValue() else { return false }
     guard let typeCF = IOPSGetProvidingPowerSourceType(info)?.takeUnretainedValue() else { return false }
     return (typeCF as String) == kIOPSACPowerValue
+}
+
+// ---------- low-battery release ----------
+// Charge of the internal battery in percent, nil without one (desktop Mac).
+func batteryPercent() -> Int? {
+    guard let info = IOPSCopyPowerSourcesInfo()?.takeRetainedValue(),
+          let list = IOPSCopyPowerSourcesList(info)?.takeRetainedValue() as? [CFTypeRef]
+    else { return nil }
+    for ps in list {
+        guard let d = IOPSGetPowerSourceDescription(info, ps)?.takeUnretainedValue() as? [String: Any],
+              (d[kIOPSTypeKey] as? String) == kIOPSInternalBatteryType,
+              let cur = d[kIOPSCurrentCapacityKey] as? Int,
+              let max = d[kIOPSMaxCapacityKey] as? Int, max > 0
+        else { continue }
+        return cur * 100 / max
+    }
+    return nil
+}
+
+// Why the battery forbids holding the Mac awake, or nil when it doesn't.
+// Only on battery: on AC the hold costs no charge, even with Low Power Mode
+// set to "Always".
+func batteryLowReason() -> String? {
+    if isOnAC() { return nil }
+    if ProcessInfo.processInfo.isLowPowerModeEnabled { return "Low Power Mode on battery" }
+    if MIN_BATTERY_PCT > 0, let pct = batteryPercent(), pct <= MIN_BATTERY_PCT {
+        return "battery at \(pct)% (cutoff \(MIN_BATTERY_PCT)%)"
+    }
+    return nil
 }
 
 func markLidUnsafe() {
